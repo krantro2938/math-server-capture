@@ -1,0 +1,114 @@
+# The whole VPS side of the LookCam stack, in one command:
+#
+#   cd vps/docker && cp .env.example .env && nano .env
+#   docker compose up -d                       # mediamtx + transcode + web
+#   docker compose --profile caddy up -d       # ...plus HTTPS on $DOMAIN
+#
+# Everything is `restart: unless-stopped`, so containers come back after a crash,
+# an OOM kill, or a reboot (as long as the Docker daemon is enabled at boot:
+# `sudo systemctl enable docker`).
+#
+# Credentials live ONLY in .env. MediaMTX reads them via its documented
+# MTX_<PARAM> env overrides, so vps/mediamtx.yml keeps its CHANGE_ME placeholders
+# and never has to hold a real password.
+
+name: lookcam
+
+services:
+  # ---------------------------------------------------------------- ingest ---
+  # Receives the capture box's push, records segments, and re-serves the stream.
+  mediamtx:
+    image: bluenviron/mediamtx:1
+    restart: unless-stopped
+    working_dir: /                     # so the config's ./recordings == /recordings
+    volumes:
+      - ../mediamtx.yml:/mediamtx.yml:ro
+      - ${RECORDINGS_DIR:-./recordings}:/recordings
+    ports:
+      # Only the ingest ports are published. RTSP/HLS/playback stay on the
+      # compose network, reachable by the web + transcode containers only.
+      - "${SRT_PORT:-8890}:8890/udp"   # SRT — MODE=copy (the phone's path)
+      # RTMP ingest is only used by MODE=h264. Left commented out so the stack
+      # can't fail to start over a port 1935 clash it never needed.
+      # - "${RTMP_PORT:-1935}:1935"
+    environment:
+      # Bind to all interfaces *inside the container*; exposure is decided by the
+      # `ports:` list above, not by the bind address as on a bare-metal install.
+      MTX_RTSPADDRESS: ":8554"
+      MTX_HLSADDRESS: ":8888"
+      MTX_PLAYBACKADDRESS: ":9996"
+      # Credentials, injected over the yml's placeholders.
+      MTX_AUTHINTERNALUSERS_0_USER: ${PUBLISH_USER:-publisher}
+      MTX_AUTHINTERNALUSERS_0_PASS: ${PUBLISH_PASS:?set PUBLISH_PASS in .env}
+      MTX_AUTHINTERNALUSERS_1_USER: ${VIEW_USER:-viewer}
+      MTX_AUTHINTERNALUSERS_1_PASS: ${VIEW_PASS:?set VIEW_PASS in .env}
+      MTX_PATHS_CAM1_RECORDDELETEAFTER: ${RECORD_KEEP:-168h}
+
+  # ------------------------------------------------------------- transcode ---
+  # MODE=copy only: the capture box pushes H.265 (which browsers can't play), so
+  # republish it as H.264. Not needed with MODE=h264 — then run:
+  #   docker compose up -d --scale transcode=0
+  transcode:
+    build:
+      context: ../..
+      dockerfile: vps/docker/Dockerfile.transcode
+    restart: unless-stopped
+    depends_on: [mediamtx]
+    environment:
+      MTX_HOST: mediamtx              # service name on the compose network
+      STREAM_KEY: ${STREAM_KEY:-cam1}
+      PUBLISH_USER: ${PUBLISH_USER:-publisher}
+      PUBLISH_PASS: ${PUBLISH_PASS:?}
+      VIEW_USER: ${VIEW_USER:-viewer}
+      VIEW_PASS: ${VIEW_PASS:?}
+      BITRATE: ${BITRATE:-2000k}
+
+  # ------------------------------------------------------------------- web ---
+  # Password-gated gateway + SPA. Proxies MediaMTX, which is why MediaMTX needs
+  # no public HTTP port of its own.
+  web:
+    image: oven/bun:1
+    restart: unless-stopped
+    depends_on: [mediamtx]
+    working_dir: /app
+    command: bun run server.ts
+    volumes:
+      - ../../web:/app:ro
+    ports:
+      # Bound to localhost: put Caddy (host or the profile below) in front for
+      # HTTPS. Change to "${WEB_PORT:-8090}:8080" only to expose it directly.
+      - "127.0.0.1:${WEB_PORT:-8090}:8080"
+    environment:
+      PORT: 8080
+      MTX_HOST: mediamtx
+      MTX_HLS_PORT: 8888
+      MTX_PLAYBACK_PORT: 9996
+      STREAM_PATH: ${STREAM_KEY:-cam1}
+      MTX_VIEW_USER: ${VIEW_USER:-viewer}
+      MTX_VIEW_PASS: ${VIEW_PASS:?}
+      APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env}
+      SESSION_SECRET: "${SESSION_SECRET:?generate one with openssl rand -hex 32}"
+      SESSION_HOURS: ${SESSION_HOURS:-720}
+
+  # ----------------------------------------------------------------- caddy ---
+  # Optional, opt-in: `docker compose --profile caddy up -d`. Gets a Let's
+  # Encrypt cert for $DOMAIN automatically. Skip it if you already run a
+  # reverse proxy on the host — then just point that at 127.0.0.1:${WEB_PORT}.
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    profiles: [caddy]
+    depends_on: [web]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data                # certs — losing this re-triggers ACME
+      - caddy_config:/config
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env, or run without --profile caddy}
+
+volumes:
+  caddy_data:
+  caddy_config:

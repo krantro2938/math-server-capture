@@ -1,0 +1,13 @@
+# HEVC -> H.264 republisher (MODE=copy). Just ffmpeg + the repo's transcode.sh,
+# which already loops and retries; `restart: unless-stopped` catches the rest.
+# Build context is the repo root, so we can copy vps/ as-is.
+FROM alpine:3.21
+
+RUN apk add --no-cache ffmpeg bash
+
+WORKDIR /app
+COPY vps/transcode.sh vps/config.env ./vps/
+
+# config.env's values are all ${VAR:-default}, so the compose environment wins
+# and no credential is ever baked into the image.
+CMD ["bash", "vps/transcode.sh"]

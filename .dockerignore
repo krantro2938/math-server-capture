@@ -1,0 +1,5 @@
+# The transcode image needs two small files; without this the build context
+# would include the 77 MB APK, the pcap, and .venv on every build.
+*
+!vps/transcode.sh
+!vps/config.env

@@ -1,0 +1,8 @@
+# Used only by the optional `caddy` profile. {$DOMAIN} comes from .env.
+# Caddy obtains and renews the TLS cert automatically — port 80 and 443 must be
+# open and the domain's A record must point at this VPS.
+{$DOMAIN} {
+	# The gateway is the only thing exposed; MediaMTX stays on the internal
+	# network and is reached through it.
+	reverse_proxy web:8080
+}

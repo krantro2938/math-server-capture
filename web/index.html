@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Camera</title>
+<!-- hls.js for live playback. Self-host it if you prefer no CDN: download
+     hls.min.js next to this file and change the src to "/live/../hls.min.js"
+     via a static route, or vendor it into the gateway. -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0d0f12; color: #e7e9ee;
+         font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 18px;
+           border-bottom: 1px solid #23262d; position: sticky; top: 0; background: #0d0f12; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .tabs { display: flex; gap: 6px; }
+  .tab { padding: 7px 14px; border-radius: 8px; border: 1px solid #23262d; background: #14171c;
+         color: #c7ccd6; cursor: pointer; font-size: 14px; }
+  .tab.active { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+  .grow { flex: 1; }
+  a.logout { color: #8b909a; font-size: 13px; text-decoration: none; }
+  a.logout:hover { color: #e7e9ee; }
+  main { padding: 18px; max-width: 1100px; margin: 0 auto; }
+  video { width: 100%; background: #000; border-radius: 12px; aspect-ratio: 16/9; }
+  .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #ef4444; display: inline-block;
+              margin-right: 6px; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 14px 0; }
+  input[type=date] { padding: 8px 10px; border-radius: 8px; border: 1px solid #2b2f37;
+                     background: #14171c; color: #e7e9ee; font-size: 14px; }
+  button.btn { padding: 8px 14px; border-radius: 8px; border: 1px solid #2b2f37; background: #14171c;
+               color: #e7e9ee; cursor: pointer; font-size: 14px; }
+  button.btn:hover { border-color: #3b82f6; }
+  button.golive { font-weight: 600; color: #f87171; border-color: #3a2426; }
+  button.golive.behind { background: #ef4444; color: #fff; border-color: #ef4444; }
+  .hint { color: #8b909a; font-size: 13px; }
+  .segs { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; max-height: 46vh;
+          overflow: auto; border: 1px solid #23262d; border-radius: 10px; padding: 6px; }
+  .seg { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 7px;
+         cursor: pointer; font-size: 14px; }
+  .seg:hover { background: #14171c; }
+  .seg.playing { background: #1e293b; color: #93c5fd; }
+  .seg .dur { color: #8b909a; font-variant-numeric: tabular-nums; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Camera</h1>
+  <div class="tabs">
+    <button class="tab active" data-tab="live" id="tab-live">● Live</button>
+    <button class="tab" data-tab="rec" id="tab-rec">Recordings</button>
+  </div>
+  <span class="grow"></span>
+  <a class="logout" href="/logout">Sign out</a>
+</header>
+
+<main>
+  <!-- LIVE -->
+  <section id="view-live">
+    <video id="live" controls autoplay muted playsinline></video>
+    <div class="row">
+      <button class="btn golive" id="golive" onclick="goLive()">● LIVE</button>
+      <span class="hint">HLS is a few seconds behind and you can scrub back; click to jump to the live edge.</span>
+    </div>
+  </section>
+
+  <!-- RECORDINGS -->
+  <section id="view-rec" class="hidden">
+    <video id="player" controls playsinline></video>
+    <div class="row">
+      <input type="date" id="date" />
+      <button class="btn" id="load">Load day</button>
+      <span class="hint" id="recinfo"></span>
+    </div>
+    <div class="segs" id="segs"></div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const liveVideo = $("#live");
+const player = $("#player");
+
+// ---------- tabs ----------
+let hls = null;
+function startLive() {
+  const src = "/live/index.m3u8";
+  if (liveVideo.canPlayType("application/vnd.apple.mpegurl")) {
+    liveVideo.src = src;                       // Safari native HLS
+    liveVideo.addEventListener("loadedmetadata", goLive, { once: true });
+  } else if (window.Hls && Hls.isSupported()) {
+    if (hls) hls.destroy();
+    hls = new Hls({
+      lowLatencyMode: true,
+      liveSyncDurationCount: 2,      // stay ~2 segments from the edge
+      liveMaxLatencyDurationCount: 6,
+      liveDurationInfinity: true,    // treat the seek bar as a true live stream
+      backBufferLength: 30,
+      // Send the session cookie on every request (hls.js omits creds by default).
+      xhrSetup: (xhr) => { xhr.withCredentials = true; },
+      fetchSetup: (context, init) => {
+        init.credentials = "include";
+        return new Request(context.url, init);
+      },
+    });
+    hls.loadSource(src);
+    hls.attachMedia(liveVideo);
+    // Jump to the live edge ONCE when it first starts — but never again, so you
+    // can freely scrub back into the buffered window without being yanked forward.
+    hls.once(Hls.Events.FRAG_BUFFERED, goLive);
+  } else {
+    $("#view-live").insertAdjacentHTML("beforeend", "<p class=hint>HLS unsupported in this browser.</p>");
+  }
+}
+function stopLive() { if (hls) { hls.destroy(); hls = null; } liveVideo.removeAttribute("src"); liveVideo.load(); }
+
+// Jump to the live edge (used by the "Go Live" button and on load).
+function goLive() {
+  const v = liveVideo;
+  try {
+    if (hls && typeof hls.liveSyncPosition === "number" && isFinite(hls.liveSyncPosition)) {
+      v.currentTime = hls.liveSyncPosition;
+    } else if (v.seekable && v.seekable.length) {
+      v.currentTime = v.seekable.end(v.seekable.length - 1);
+    }
+    v.play().catch(() => {});
+  } catch (e) {}
+}
+
+// Show how far behind live we are, and highlight the button when drifting.
+function updateLiveLag() {
+  const v = liveVideo, btn = $("#golive");
+  if (!btn || $("#view-live").classList.contains("hidden")) return;
+  let edge = null;
+  if (hls && isFinite(hls.liveSyncPosition)) edge = hls.liveSyncPosition;
+  else if (v.seekable && v.seekable.length) edge = v.seekable.end(v.seekable.length - 1);
+  if (edge != null) {
+    const lag = Math.max(0, edge - v.currentTime);
+    btn.classList.toggle("behind", lag > 4);
+    btn.textContent = lag > 4 ? `● GO LIVE (−${lag.toFixed(0)}s)` : "● LIVE";
+  }
+}
+setInterval(updateLiveLag, 1000);
+
+document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+  t.classList.add("active");
+  const live = t.dataset.tab === "live";
+  $("#view-live").classList.toggle("hidden", !live);
+  $("#view-rec").classList.toggle("hidden", live);
+  if (live) { startLive(); } else { stopLive(); if (!$("#segs").dataset.loaded) loadDay(); }
+}));
+
+// ---------- recordings ----------
+const dateEl = $("#date");
+dateEl.value = new Date().toISOString().slice(0, 10);
+let segments = [];
+let playingIdx = -1;
+
+function fmtTime(iso) {
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+function fmtDur(s) {
+  const m = Math.floor(s / 60), sec = Math.round(s % 60);
+  return m ? `${m}m ${sec}s` : `${sec}s`;
+}
+
+async function loadDay() {
+  const date = dateEl.value;
+  $("#recinfo").textContent = "Loading…";
+  $("#segs").dataset.loaded = "1";
+  try {
+    const res = await fetch(`/api/recordings?date=${date}`);
+    segments = await res.json();
+  } catch { segments = []; }
+  const list = $("#segs");
+  list.innerHTML = "";
+  if (!segments.length) {
+    $("#recinfo").textContent = "No recordings for this day.";
+    return;
+  }
+  const total = segments.reduce((a, s) => a + s.duration, 0);
+  $("#recinfo").textContent = `${segments.length} segment(s), ${fmtDur(total)} total`;
+  segments.forEach((s, i) => {
+    const row = document.createElement("div");
+    row.className = "seg";
+    row.innerHTML = `<span>${fmtTime(s.start)}</span><span class="dur">${fmtDur(s.duration)}</span>`;
+    row.addEventListener("click", () => play(i));
+    list.appendChild(row);
+  });
+}
+
+function play(i) {
+  if (i < 0 || i >= segments.length) return;
+  playingIdx = i;
+  document.querySelectorAll(".seg").forEach((el, idx) => el.classList.toggle("playing", idx === i));
+  player.src = segments[i].url;
+  player.play().catch(() => {});
+  player.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Auto-advance to the next segment for continuous playback.
+player.addEventListener("ended", () => { if (playingIdx + 1 < segments.length) play(playingIdx + 1); });
+$("#load").addEventListener("click", loadDay);
+
+// Boot into live.
+startLive();
+</script>
+</body>
+</html>
