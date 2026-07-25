@@ -150,6 +150,28 @@ curl -s -X POST -H "X-API-Token: $TOKEN" http://127.0.0.1:8091/start
 curl -s -H "X-API-Token: $TOKEN" http://127.0.0.1:8091/assignment | jq
 ```
 
+Port 8091 is published on all interfaces so it can be reached from off-box —
+`sudo ufw allow 8091/tcp`. `API_TOKEN` is the only gate, and this is plain
+HTTP, so the token crosses the network in the clear: anyone who sniffs it can
+read the assignment and spend Gemini calls via `/start`. Set
+`ASSIGNMENT_BIND=127.0.0.1` in `.env` to keep it local and reach it over an SSH
+tunnel instead, or put it behind the stack's Caddy for TLS.
+
+### On the glasses
+
+The [evens document server](../../evens/server) reads this one and renders the
+assignment onto the Even Realities glasses, live, as the transcription fills
+in — with the model's camera advice in the corner and tap-to-start/stop. Point
+it here:
+
+```bash
+ASSIGNMENT_URL=http://<vps-ip>:8091 ASSIGNMENT_TOKEN=$TOKEN bun run start
+```
+
+It holds one SSE connection no matter how many glasses are watching, and keeps
+the token on its side — `EventSource` can't send headers, so a client talking
+to this service directly would have to carry the token in a query string.
+
 Standalone:
 
 ```bash

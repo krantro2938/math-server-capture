@@ -106,7 +106,12 @@ services:
     profiles: [assignment]
     depends_on: [mediamtx, web]
     ports:
-      - "127.0.0.1:${ASSIGNMENT_PORT:-8091}:8091"
+      # Published on all interfaces so the glasses' document server (evens/) can
+      # reach it from off-box. API_TOKEN is the gate — but this is plain HTTP,
+      # so the token crosses the network in the clear. Set
+      # ASSIGNMENT_BIND=127.0.0.1 in .env to keep it local (and reach it over an
+      # SSH tunnel) if that matters to you.
+      - "${ASSIGNMENT_BIND:-0.0.0.0}:${ASSIGNMENT_PORT:-8091}:8091"
     volumes:
       - assignment_data:/app/data      # state.json survives restarts + rebuilds
     environment:
