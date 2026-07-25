@@ -29,11 +29,13 @@ scratchpad/
 *.h265
 *.hevc
 *.mp4
-*.ts
 *.m3u8
 *.m4s
 recordings/
 vps/docker/recordings/
+# NB: no bare `*.ts` here, however tempting for MPEG-TS dumps — it also matches
+# TypeScript, and would silently drop web/server.ts from the repo (it did once).
+# MPEG-TS only ever lands in the ignored recordings/ dirs anyway.
 
 # ------------------------------------------------------------------- logs ---
 *.log

@@ -1,0 +1,168 @@
+// Gateway + frontend for the LookCam bridge.
+//
+// One public port. Serves the SPA, handles a shared-password login, and proxies
+// to MediaMTX (which stays bound to localhost) injecting the viewer credentials:
+//   - live:        HLS  ->  http://MTX:8888/<path>/*
+//   - recordings:  playback /list + /get on http://MTX:9996
+//
+// Run with Bun:   bun run server.ts   (or `bun run start`)
+// Configure via env (see .env.example). Nothing here is camera-specific.
+
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const CFG = {
+  port: Number(process.env.PORT ?? 8080),
+  appPassword: process.env.APP_PASSWORD ?? "changeme",
+  sessionSecret: process.env.SESSION_SECRET ?? "please-set-a-long-random-secret",
+  sessionHours: Number(process.env.SESSION_HOURS ?? 720), // 30 days
+  mtxHost: process.env.MTX_HOST ?? "127.0.0.1",
+  hlsPort: Number(process.env.MTX_HLS_PORT ?? 8888),
+  playbackPort: Number(process.env.MTX_PLAYBACK_PORT ?? 9996),
+  streamPath: process.env.STREAM_PATH ?? "cam1",
+  mtxUser: process.env.MTX_VIEW_USER ?? "viewer",
+  mtxPass: process.env.MTX_VIEW_PASS ?? "CHANGE_ME_VIEW",
+};
+
+const mtxAuth = "Basic " + Buffer.from(`${CFG.mtxUser}:${CFG.mtxPass}`).toString("base64");
+const COOKIE = "camsess";
+
+// ---- tiny signed-cookie session -------------------------------------------
+function sign(exp: number): string {
+  const mac = createHmac("sha256", CFG.sessionSecret).update(String(exp)).digest("base64url");
+  return `${exp}.${mac}`;
+}
+function valid(token: string | undefined): boolean {
+  if (!token) return false;
+  const dot = token.indexOf(".");
+  if (dot < 0) return false;
+  const exp = Number(token.slice(0, dot));
+  if (!Number.isFinite(exp) || Date.now() > exp) return false;
+  const expected = sign(exp);
+  const a = Buffer.from(token);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+function cookies(req: Request): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const p of (req.headers.get("cookie") ?? "").split(";")) {
+    const i = p.indexOf("=");
+    if (i > 0) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim());
+  }
+  return out;
+}
+const authed = (req: Request) => valid(cookies(req)[COOKIE]);
+
+// ---- MediaMTX proxy helpers -----------------------------------------------
+async function proxyHls(rest: string): Promise<Response> {
+  // rest is the part after /live/, INCLUDING any query string — MediaMTX's
+  // low-latency HLS needs the ?session=… param, so it must be forwarded intact
+  // (e.g. "index.m3u8" or "video1_stream.m3u8?session=…" or "segment3.mp4").
+  const url = `http://${CFG.mtxHost}:${CFG.hlsPort}/${CFG.streamPath}/${rest}`;
+  const upstream = await fetch(url, { headers: { Authorization: mtxAuth } });
+  const headers = new Headers(upstream.headers);
+  headers.delete("www-authenticate");
+  return new Response(upstream.body, { status: upstream.status, headers });
+}
+
+async function playbackList(date: string): Promise<Response> {
+  // date = YYYY-MM-DD -> list that whole local day.
+  const start = new Date(`${date}T00:00:00`);
+  const end = new Date(start.getTime() + 24 * 3600 * 1000);
+  const qs = new URLSearchParams({
+    path: CFG.streamPath,
+    start: start.toISOString(),
+    end: end.toISOString(),
+  });
+  const url = `http://${CFG.mtxHost}:${CFG.playbackPort}/list?${qs}`;
+  const upstream = await fetch(url, { headers: { Authorization: mtxAuth } });
+  if (!upstream.ok) return new Response("[]", { status: 200, headers: json });
+  const segs = (await upstream.json()) as Array<{ start: string; duration: number }>;
+  // Rewrite to point at our own /api/clip so creds stay server-side.
+  const rewritten = segs.map((s) => ({
+    start: s.start,
+    duration: s.duration,
+    url: `/api/clip?start=${encodeURIComponent(s.start)}&duration=${s.duration}`,
+  }));
+  return new Response(JSON.stringify(rewritten), { headers: json });
+}
+
+async function playbackClip(start: string, duration: string): Promise<Response> {
+  const qs = new URLSearchParams({
+    path: CFG.streamPath,
+    start,
+    duration,
+    format: "fmp4",
+  });
+  const url = `http://${CFG.mtxHost}:${CFG.playbackPort}/get?${qs}`;
+  const upstream = await fetch(url, { headers: { Authorization: mtxAuth } });
+  const headers = new Headers(upstream.headers);
+  headers.delete("www-authenticate");
+  if (!headers.has("content-type")) headers.set("content-type", "video/mp4");
+  return new Response(upstream.body, { status: upstream.status, headers });
+}
+
+const json = { "content-type": "application/json" };
+const html = { "content-type": "text/html; charset=utf-8" };
+
+// ---- routing ---------------------------------------------------------------
+const INDEX = await Bun.file(new URL("./index.html", import.meta.url)).text();
+const LOGIN = await Bun.file(new URL("./login.html", import.meta.url)).text();
+
+Bun.serve({
+  port: CFG.port,
+  async fetch(req) {
+    const url = new URL(req.url);
+    const path = url.pathname;
+
+    if (path === "/login" && req.method === "POST") {
+      const form = await req.formData();
+      const pw = String(form.get("password") ?? "");
+      const a = Buffer.from(pw);
+      const b = Buffer.from(CFG.appPassword);
+      const ok = a.length === b.length && timingSafeEqual(a, b);
+      if (!ok) return new Response(LOGIN.replace("<!--ERR-->", "Wrong password"), { status: 401, headers: html });
+      const exp = Date.now() + CFG.sessionHours * 3600 * 1000;
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: "/",
+          "Set-Cookie": `${COOKIE}=${sign(exp)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${CFG.sessionHours * 3600}`,
+        },
+      });
+    }
+
+    if (path === "/logout") {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: "/", "Set-Cookie": `${COOKIE}=; Path=/; Max-Age=0` },
+      });
+    }
+
+    if (!authed(req)) {
+      if (path === "/") return new Response(LOGIN.replace("<!--ERR-->", ""), { headers: html });
+      return new Response("unauthorized", { status: 401 });
+    }
+
+    // --- authenticated routes ---
+    if (path === "/") return new Response(INDEX, { headers: html });
+
+    if (path.startsWith("/live/")) return proxyHls(path.slice("/live/".length) + url.search);
+
+    if (path === "/api/recordings") {
+      const date = url.searchParams.get("date") ?? new Date().toISOString().slice(0, 10);
+      return playbackList(date);
+    }
+
+    if (path === "/api/clip") {
+      const start = url.searchParams.get("start");
+      const duration = url.searchParams.get("duration");
+      if (!start || !duration) return new Response("bad request", { status: 400 });
+      return playbackClip(start, duration);
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+});
+
+console.log(`camera frontend on http://0.0.0.0:${CFG.port}  (stream: ${CFG.streamPath})`);
+console.log(`proxying MediaMTX at ${CFG.mtxHost} (HLS :${CFG.hlsPort}, playback :${CFG.playbackPort})`);
