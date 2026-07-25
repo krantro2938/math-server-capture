@@ -22,7 +22,7 @@ echo "[*] updating packages..."
 pkg update -y && pkg upgrade -y
 # clang is needed because aiohttp (an aiopppp dependency) has no prebuilt wheel
 # for Android and gets compiled here.
-pkg install -y python python-pip clang binutils ffmpeg iproute2 termux-tools
+pkg install -y python python-pip clang binutils ffmpeg iproute2 termux-tools nano git
 
 echo "[*] installing aiopppp (this compiles aiohttp — a few minutes on a phone)..."
 # NB: do NOT `pip install --upgrade pip` on Termux — it refuses (pip is managed

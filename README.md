@@ -149,7 +149,8 @@ see the camera on the hotspot, set `EXTRA_BROADCAST="192.168.43.255"` in
 | `vps/mediamtx.yml` | MediaMTX: ingest + record + playback, with auth |
 | `vps/transcode.sh` · `vps/install-transcode.sh` | VPS HEVC→H.264 transcode (only for `MODE=copy`) + its systemd unit |
 | `vps/setup-web.sh` | Install the web gateway + Caddy HTTPS |
-| `web/server.ts` · `web/index.html` | Bun gateway + SPA: password login, live + DVR |
+| `web/server.ts` · `web/index.html` | Bun gateway + SPA: password login, live + DVR, `GET /api/snapshot.jpg` (one still frame) |
+| `assignment/` | Reads an assignment off the paper via Gemini — one `POST /start`, SSE progress, LaTeX output |
 | `client.py` · `run_aiopppp.py` · `probe_cmds.py` · `pcap_*.py` | RE tools used to crack the protocol (kept for reference) |
 
 `stream` index: `0`=4K, `1`=2K/1080p, `2`=1080p (from the camera's `GetDevStream`).

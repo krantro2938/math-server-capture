@@ -67,13 +67,16 @@ services:
   # Password-gated gateway + SPA. Proxies MediaMTX, which is why MediaMTX needs
   # no public HTTP port of its own.
   web:
-    image: oven/bun:1
+    # Built rather than plain oven/bun because /api/snapshot.jpg needs ffmpeg to
+    # decode a still frame (MediaMTX has no image endpoint).
+    build:
+      context: ../../web
     restart: unless-stopped
     depends_on: [mediamtx]
     working_dir: /app
     command: bun run server.ts
     volumes:
-      - ../../web:/app:ro
+      - ../../web:/app:ro          # edit the SPA without rebuilding
     ports:
       # Bound to localhost: put Caddy (host or the profile below) in front for
       # HTTPS. Change to "${WEB_PORT:-8090}:8080" only to expose it directly.
@@ -89,6 +92,35 @@ services:
       APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env}
       SESSION_SECRET: "${SESSION_SECRET:?generate one with openssl rand -hex 32}"
       SESSION_HOURS: ${SESSION_HOURS:-720}
+      MTX_RTSP_PORT: 8554
+      SNAPSHOT_TOKEN: ${SNAPSHOT_TOKEN:-}    # lets the assignment reader pull stills
+
+  # ------------------------------------------------------------ assignment ---
+  # Opt-in: `docker compose --profile assignment up -d`. Reads the assignment on
+  # the desk out of the live stream via Gemini. Needs GEMINI_API_KEY in .env.
+  # Left out of the default set so the camera stack never depends on it.
+  assignment:
+    build:
+      context: ../../assignment
+    restart: unless-stopped
+    profiles: [assignment]
+    depends_on: [mediamtx, web]
+    ports:
+      - "127.0.0.1:${ASSIGNMENT_PORT:-8091}:8091"
+    volumes:
+      - assignment_data:/app/data      # state.json survives restarts + rebuilds
+    environment:
+      PORT: 8091
+      # Frames come from the gateway's snapshot API — one service owns stream
+      # access. (Clear SNAPSHOT_URL to fall back to direct RTSP below.)
+      SNAPSHOT_URL: http://web:8080/api/snapshot.jpg
+      SNAPSHOT_TOKEN: ${SNAPSHOT_TOKEN:?set SNAPSHOT_TOKEN in .env}
+      RTSP_URL: rtsp://${VIEW_USER:-viewer}:${VIEW_PASS:?}@mediamtx:8554/${STREAM_KEY:-cam1}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      API_TOKEN: ${ASSIGNMENT_TOKEN:?set ASSIGNMENT_TOKEN in .env}
+      INTERVAL_MS: ${ASSIGNMENT_INTERVAL_MS:-1000}
+      MAX_CAPTURES: ${ASSIGNMENT_MAX_CAPTURES:-40}   # spend ceiling per job
 
   # ----------------------------------------------------------------- caddy ---
   # Optional, opt-in: `docker compose --profile caddy up -d`. Gets a Let's
@@ -112,3 +144,4 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  assignment_data:

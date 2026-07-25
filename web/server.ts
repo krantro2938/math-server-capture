@@ -4,6 +4,9 @@
 // to MediaMTX (which stays bound to localhost) injecting the viewer credentials:
 //   - live:        HLS  ->  http://MTX:8888/<path>/*
 //   - recordings:  playback /list + /get on http://MTX:9996
+//   - snapshot:    GET /api/snapshot.jpg -> one JPEG off the live stream, so
+//                  anything that wants a still (the assignment reader, a
+//                  dashboard, a cron job) asks HTTP instead of speaking RTSP
 //
 // Run with Bun:   bun run server.ts   (or `bun run start`)
 // Configure via env (see .env.example). Nothing here is camera-specific.
@@ -21,6 +24,14 @@ const CFG = {
   streamPath: process.env.STREAM_PATH ?? "cam1",
   mtxUser: process.env.MTX_VIEW_USER ?? "viewer",
   mtxPass: process.env.MTX_VIEW_PASS ?? "CHANGE_ME_VIEW",
+  rtspPort: Number(process.env.MTX_RTSP_PORT ?? 8554),
+  // Lets a service (the assignment reader) fetch snapshots without a browser
+  // session. Empty = no service access; browser cookie still works.
+  snapshotToken: process.env.SNAPSHOT_TOKEN ?? "",
+  // Snapshots are served from a short cache so ten callers don't spawn ten
+  // ffmpegs. Callers that need a guaranteed-fresh frame pass ?max_age_ms=0.
+  snapshotTtlMs: Number(process.env.SNAPSHOT_TTL_MS ?? 1000),
+  snapshotTimeoutMs: Number(process.env.SNAPSHOT_TIMEOUT_MS ?? 20000),
 };
 
 const mtxAuth = "Basic " + Buffer.from(`${CFG.mtxUser}:${CFG.mtxPass}`).toString("base64");
@@ -101,6 +112,47 @@ async function playbackClip(start: string, duration: string): Promise<Response> 
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
+// ---- snapshot (one JPEG off the live stream) -------------------------------
+// MediaMTX has no still-image endpoint, so we decode a single frame with
+// ffmpeg. Kept here rather than in each consumer: this process already holds
+// the MediaMTX credentials, so nothing else needs them or needs to speak RTSP.
+let snapCache: { at: number; jpeg: Buffer } | null = null;
+let snapInFlight: Promise<Buffer> | null = null;
+
+async function grabJpeg(): Promise<Buffer> {
+  const rtsp = `rtsp://${encodeURIComponent(CFG.mtxUser)}:${encodeURIComponent(CFG.mtxPass)}` +
+               `@${CFG.mtxHost}:${CFG.rtspPort}/${CFG.streamPath}`;
+  const proc = Bun.spawn([
+    "ffmpeg", "-hide_banner", "-loglevel", "error",
+    "-rtsp_transport", "tcp", "-i", rtsp,
+    "-frames:v", "1", "-q:v", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "-",
+  ], { stdout: "pipe", stderr: "pipe" });
+  const timer = setTimeout(() => proc.kill(), CFG.snapshotTimeoutMs);
+  try {
+    const [buf, err] = await Promise.all([
+      new Response(proc.stdout).arrayBuffer(),
+      new Response(proc.stderr).text(),
+    ]);
+    await proc.exited;
+    const jpeg = Buffer.from(buf);
+    if (jpeg.length === 0) throw new Error(`no frame — is the stream publishing? ${err.trim()}`);
+    return jpeg;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function snapshot(maxAgeMs: number): Promise<Buffer> {
+  if (snapCache && Date.now() - snapCache.at <= maxAgeMs) return snapCache.jpeg;
+  // Coalesce concurrent callers onto one ffmpeg run.
+  if (!snapInFlight) {
+    snapInFlight = grabJpeg()
+      .then((jpeg) => { snapCache = { at: Date.now(), jpeg }; return jpeg; })
+      .finally(() => { snapInFlight = null; });
+  }
+  return snapInFlight;
+}
+
 const json = { "content-type": "application/json" };
 const html = { "content-type": "text/html; charset=utf-8" };
 
@@ -138,9 +190,35 @@ Bun.serve({
       });
     }
 
-    if (!authed(req)) {
+    // Service access to snapshots: a shared token instead of a browser session,
+    // so the assignment reader (or anything else) can pull a still. Checked
+    // before the cookie gate; every other route stays session-only.
+    const snapToken = req.headers.get("x-snapshot-token") ?? url.searchParams.get("token") ?? "";
+    const tokenOk = CFG.snapshotToken !== "" && snapToken === CFG.snapshotToken;
+
+    if (!authed(req) && !(tokenOk && path === "/api/snapshot.jpg")) {
       if (path === "/") return new Response(LOGIN.replace("<!--ERR-->", ""), { headers: html });
       return new Response("unauthorized", { status: 401 });
+    }
+
+    // One still frame from the live stream.
+    //   /api/snapshot.jpg              — may be up to SNAPSHOT_TTL_MS old
+    //   /api/snapshot.jpg?max_age_ms=0 — force a fresh grab
+    if (path === "/api/snapshot.jpg") {
+      const raw = url.searchParams.get("max_age_ms");
+      const maxAge = raw !== null && Number.isFinite(Number(raw)) ? Number(raw) : CFG.snapshotTtlMs;
+      try {
+        const jpeg = await snapshot(maxAge);
+        return new Response(jpeg, {
+          headers: {
+            "content-type": "image/jpeg",
+            "cache-control": "no-store",
+            "x-frame-age-ms": String(snapCache ? Date.now() - snapCache.at : 0),
+          },
+        });
+      } catch (e: any) {
+        return new Response(JSON.stringify({ error: String(e?.message ?? e) }), { status: 502, headers: json });
+      }
     }
 
     // --- authenticated routes ---
