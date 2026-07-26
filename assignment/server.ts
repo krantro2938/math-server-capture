@@ -849,6 +849,11 @@ function toMarkdown(a: Assignment): string {
 const server = Bun.serve({
     port: cfg.port,
     hostname: "0.0.0.0",
+    // /events is a long-lived SSE stream and Bun's default is 10s, which is
+    // shorter than the 20s keep-alive ping below — so every listener was being
+    // dropped before its first heartbeat and reconnecting in a loop. Must stay
+    // comfortably above that ping interval. (Bun caps this at 255.)
+    idleTimeout: 120,
     async fetch(req) {
         const url = new URL(req.url);
         const path = url.pathname;
