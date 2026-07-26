@@ -62,6 +62,11 @@ services:
       VIEW_USER: ${VIEW_USER:-viewer}
       VIEW_PASS: ${VIEW_PASS:?}
       BITRATE: ${BITRATE:-2000k}
+      # Keyframe interval — the dominant latency term in the stack. Must stay
+      # equal to hlsSegmentDuration in vps/mediamtx.yml.
+      GOP_SECONDS: ${GOP_SECONDS:-1}
+      FPS: ${FPS:-15}
+      PRESET: ${PRESET:-veryfast}
 
   # ------------------------------------------------------------------- web ---
   # Password-gated gateway + SPA. Proxies MediaMTX, which is why MediaMTX needs

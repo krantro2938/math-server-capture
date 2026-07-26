@@ -26,7 +26,7 @@ if [ -f "$CONF" ]; then . "$CONF"; else echo "[!] missing $CONF"; exit 1; fi
 : "${PUBLISH_PASS:?set it in $CONF}"
 : "${MODE:=copy}"           ; : "${FPS:=15}" ; : "${CRF:=20}" ; : "${MAXRATE:=5000k}"
 : "${DISCOVER_TIMEOUT:=5}"  ; : "${DISCOVER_RETRY:=10}" ; : "${EXTRA_BROADCAST:=}"
-: "${EXTRA_SUBNET:=}"
+: "${EXTRA_SUBNET:=}"  ; : "${SRT_LATENCY:=120000}"
 
 PYTHON="./.venv/bin/python"; [ -x "$PYTHON" ] || PYTHON="python3"
 command -v ffmpeg >/dev/null || { echo "[!] ffmpeg not installed"; exit 1; }
@@ -62,8 +62,13 @@ case "$MODE" in
   copy)
     # Push raw HEVC to a *_hevc source path; vps/transcode.sh turns it into the
     # browser-ready H.264 path the frontend reads.
-    PUSH=(-c:v copy -an -f mpegts
-          "srt://${VPS_HOST}:8890?streamid=publish:${STREAM_KEY}_hevc:${PUBLISH_USER}:${PUBLISH_PASS}&pkt_size=1316")
+    #
+    # -muxdelay/-muxpreload 0 matter more than they look: ffmpeg's mpegts muxer
+    # defaults to a 0.7s preload, which is 0.7s of pure latency added here for
+    # no benefit on a live push. -flush_packets emits each packet immediately
+    # instead of letting the muxer accumulate.
+    PUSH=(-c:v copy -an -f mpegts -muxdelay 0 -muxpreload 0 -flush_packets 1
+          "srt://${VPS_HOST}:8890?streamid=publish:${STREAM_KEY}_hevc:${PUBLISH_USER}:${PUBLISH_PASS}&pkt_size=1316&latency=${SRT_LATENCY}")
     ;;
   *) echo "bad MODE=$MODE (want copy or h264)"; exit 1 ;;
 esac
@@ -98,13 +103,44 @@ find_camera() {
 }
 
 echo "[*] capture: uid=${CAM_UID:-any} ip=${CAMERA_IP} stream=${STREAM} -> ${VPS_HOST} (${MODE})"
+
+# A plain `python … | ffmpeg …` only completes when BOTH ends exit, so half a
+# dead pipeline hangs the whole supervisor. That is not hypothetical: bringing a
+# VPN up on the phone killed ffmpeg's SRT socket, ffmpeg quit, the Python side
+# kept happily sending P2PAlive into a pipe nobody was reading, and the stream
+# stayed down until someone noticed by hand. Run the two as explicit jobs
+# instead, wait for whichever dies first, and take the survivor with it.
+FIFO=""
+cleanup() {
+  [ -n "${PY_PID:-}" ] && kill "$PY_PID" 2>/dev/null
+  [ -n "${FF_PID:-}" ] && kill "$FF_PID" 2>/dev/null
+  [ -n "$FIFO" ] && rm -f "$FIFO"
+}
+trap 'cleanup; exit 0' INT TERM
+
 while true; do
   CAM_ADDR="$(find_camera)"
   echo "[*] camera at ${CAM_ADDR} — starting stream"
+
+  FIFO="$(mktemp -u "${TMPDIR:-/tmp}/lookcam.XXXXXX")"
+  mkfifo "$FIFO" || { echo "[!] cannot create fifo"; sleep 5; continue; }
+
   "$PYTHON" lookcam_stream.py -a "$CAM_ADDR" -p "$CAM_PASS" --stream "$STREAM" --pipe \
-    | ffmpeg -hide_banner -loglevel warning \
-        -use_wallclock_as_timestamps 1 -fflags +genpts \
-        -f hevc -i - "${PUSH[@]}"
+    > "$FIFO" &
+  PY_PID=$!
+  ffmpeg -hide_banner -loglevel warning \
+      -fflags +genpts+nobuffer -flags low_delay \
+      -use_wallclock_as_timestamps 1 \
+      -f hevc -i "$FIFO" "${PUSH[@]}" &
+  FF_PID=$!
+
+  # Whichever exits first — camera drop, SRT death, OOM, a hang we SIGTERM —
+  # ends the round. Then kill the other so we never leak a half-pipeline.
+  wait -n "$PY_PID" "$FF_PID" 2>/dev/null
+  kill "$PY_PID" "$FF_PID" 2>/dev/null
+  wait "$PY_PID" 2>/dev/null; wait "$FF_PID" 2>/dev/null
+  rm -f "$FIFO"; FIFO=""; PY_PID=""; FF_PID=""
+
   echo "[!] pipeline exited (camera/network drop?). re-finding camera in 3s..."
   sleep 3
 done

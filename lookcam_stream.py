@@ -22,7 +22,7 @@ Reconnects automatically; a stall watchdog drops a dead session.
 
 stream index: 0=4K, 1=2K/1080p, 2=1080p (per GetDevStream); default 1.
 """
-import argparse, asyncio, collections, json, logging, struct, sys, time
+import argparse, asyncio, collections, json, logging, os, struct, sys, time
 
 from aiopppp.const import CAM_MAGIC, PacketType
 from aiopppp.packets import DrwPkt, Packet, parse_packet as _orig_parse
@@ -228,7 +228,27 @@ def main():
         if out:
             out.write(hevc); out.flush()
         if args.pipe:
-            sys.stdout.buffer.write(hevc); sys.stdout.buffer.flush()
+            try:
+                sys.stdout.buffer.write(hevc); sys.stdout.buffer.flush()
+            except (BrokenPipeError, OSError) as exc:
+                # ffmpeg downstream has gone (its SRT socket died, it was OOM
+                # killed, the VPS moved...). Nothing here can revive it, and
+                # staying alive is actively harmful: this runs inside an asyncio
+                # callback, so the exception gets swallowed and the session sails
+                # on sending P2PAlive forever while no video reaches anyone. The
+                # shell pipeline in run/capture.sh only completes when BOTH ends
+                # exit, so a surviving producer wedges the supervisor for good —
+                # which is exactly how a VPN flap turned into a dead stream that
+                # never came back. Exit and let the supervisor rebuild the pipe.
+                log.error("downstream closed the pipe (%s) — exiting so the "
+                          "supervisor can restart the pipeline", exc)
+                if out:
+                    try:
+                        out.close()
+                    except OSError:
+                        pass
+                sys.stderr.flush()
+                os._exit(4)
     rc = 0
     try:
         rc = asyncio.run(amain(args, sink)) or 0

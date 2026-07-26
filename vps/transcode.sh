@@ -16,17 +16,38 @@ if [ -f "$CONF" ]; then . "$CONF"; else echo "[!] missing vps/$CONF"; exit 1; fi
 : "${STREAM_KEY:=cam1}"    ; : "${MTX_HOST:=127.0.0.1}"
 : "${PUBLISH_USER:=publisher}" ; : "${PUBLISH_PASS:?set it in vps/$CONF}"
 : "${VIEW_USER:=viewer}"       ; : "${VIEW_PASS:?set it in vps/$CONF}"
-: "${BITRATE:=2000k}"
+: "${BITRATE:=2000k}"          ; : "${GOP_SECONDS:=1}"
+: "${FPS:=15}"                 ; : "${PRESET:=veryfast}"
+GOP_FRAMES=$(( FPS * GOP_SECONDS )); [ "$GOP_FRAMES" -ge 1 ] || GOP_FRAMES=15
 
 SRC="rtsp://${VIEW_USER}:${VIEW_PASS}@${MTX_HOST}:8554/${STREAM_KEY}_hevc"
 DST="rtsp://${PUBLISH_USER}:${PUBLISH_PASS}@${MTX_HOST}:8554/${STREAM_KEY}"
 
-echo "[*] transcoding ${STREAM_KEY}_hevc (HEVC) -> ${STREAM_KEY} (H.264 @ ${BITRATE})"
+echo "[*] transcoding ${STREAM_KEY}_hevc (HEVC) -> ${STREAM_KEY} (H.264 @ ${BITRATE}," \
+     "keyframe every ${GOP_SECONDS}s / ${GOP_FRAMES}f, preset ${PRESET})"
 while true; do
   # Fails immediately while the capture box is offline (nothing published on the
   # _hevc path yet) — that's expected; we just keep retrying until it appears.
-  ffmpeg -hide_banner -loglevel warning -rtsp_transport tcp -i "$SRC" \
-    -c:v libx264 -preset veryfast -tune zerolatency -b:v "$BITRATE" -g 40 -pix_fmt yuv420p \
+  #
+  # Keyframe cadence is the whole ballgame for latency. HLS cannot cut a segment
+  # anywhere but a keyframe, so this interval — not hlsSegmentDuration — decides
+  # how long segments really are, and the player then sits a multiple of that
+  # behind live. The old -g 40 meant 2.7s segments at 15fps and made the 1s
+  # setting in mediamtx.yml a dead letter.
+  #
+  # Both a frame count AND a time expression, deliberately: the camera's
+  # delivered rate wanders either side of 15fps, so a pure -g would drift the
+  # segment length with it. -force_key_frames pins keyframes to real seconds,
+  # and scenecut is disabled so nothing inserts extras in between (irregular
+  # segments upset LL-HLS part timing).
+  ffmpeg -hide_banner -loglevel warning \
+    -fflags nobuffer -flags low_delay -avioflags direct \
+    -probesize 500000 -analyzeduration 500000 \
+    -rtsp_transport tcp -i "$SRC" \
+    -c:v libx264 -preset "$PRESET" -tune zerolatency -b:v "$BITRATE" \
+    -g "$GOP_FRAMES" -keyint_min "$GOP_FRAMES" -sc_threshold 0 \
+    -force_key_frames "expr:gte(t,n_forced*${GOP_SECONDS})" \
+    -pix_fmt yuv420p -flush_packets 1 \
     -an -f rtsp -rtsp_transport tcp "$DST"
   echo "[!] transcode exited (source down?). retrying in 3s..."
   sleep 3

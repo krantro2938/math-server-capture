@@ -96,8 +96,16 @@ function startLive() {
     if (hls) hls.destroy();
     hls = new Hls({
       lowLatencyMode: true,
-      liveSyncDurationCount: 2,      // stay ~2 segments from the edge
-      liveMaxLatencyDurationCount: 6,
+      // Deliberately NO liveSyncDurationCount here. Setting it overrides the
+      // playlist's PART-HOLD-BACK, which is what actually makes LL-HLS low
+      // latency — the old value of 2 parked us two *segments* (~5s) behind the
+      // edge and quietly cancelled the low-latency mode configured on the
+      // server. Left unset, hls.js honours MediaMTX's PART-HOLD-BACK
+      // (3 x hlsPartDuration = 600ms).
+      liveMaxLatencyDurationCount: 6,   // still bail forward if we fall way behind
+      // Nudge playback up to 1.05x to close a small gap rather than jumping,
+      // which is far less jarring than a seek on a live view.
+      maxLiveSyncPlaybackRate: 1.05,
       liveDurationInfinity: true,    // treat the seek bar as a true live stream
       backBufferLength: 30,
       // Send the session cookie on every request (hls.js omits creds by default).
