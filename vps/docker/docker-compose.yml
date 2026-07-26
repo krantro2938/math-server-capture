@@ -42,7 +42,7 @@ services:
       MTX_AUTHINTERNALUSERS_0_PASS: ${PUBLISH_PASS:?set PUBLISH_PASS in .env}
       MTX_AUTHINTERNALUSERS_1_USER: ${VIEW_USER:-viewer}
       MTX_AUTHINTERNALUSERS_1_PASS: ${VIEW_PASS:?set VIEW_PASS in .env}
-      MTX_PATHS_CAM1_RECORDDELETEAFTER: ${RECORD_KEEP:-168h}
+      MTX_PATHS_CAM1_RECORDDELETEAFTER: ${RECORD_KEEP:-24h}
 
   # ------------------------------------------------------------- transcode ---
   # MODE=copy only: the capture box pushes H.265 (which browsers can't play), so

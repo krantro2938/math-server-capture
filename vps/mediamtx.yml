@@ -72,7 +72,9 @@ paths:
     recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f
     recordFormat: fmp4
     recordSegmentDuration: 900s
-    recordDeleteAfter: 168h          # auto-purge after 7 days; set 0 to keep forever
+    recordDeleteAfter: 24h           # auto-purge after 1 day; set 0 to keep forever
+                                     # 1080p15 fmp4 runs ~800 MB/h, so a day is
+                                     # ~19 GB — already most of a 30 GB disk.
 
   # Raw H.265 source, only used in copy mode (weak capture box). Not recorded
   # here; vps/transcode.sh reads it and republishes cam1 as H.264.
