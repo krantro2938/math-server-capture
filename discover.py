@@ -288,41 +288,73 @@ def hexdump(data: bytes, limit: int = 96) -> str:
 
 # ---- probing -----------------------------------------------------------------
 
-def open_sockets(ifaces) -> list[tuple[socket.socket, str | None]]:
-    """One socket bound per interface, plus one unbound.
+# A modem/point-to-point interface hands out a huge fake prefix (Android's
+# ccmni* mobile-data links show up as /8). Broadcast is meaningless there, and
+# the link is metered — so we never aim probes at anything this coarse.
+LAN_MAX_PREFIX = 16
+
+
+def open_sockets(ifaces) -> list[tuple[socket.socket, str | None, object]]:
+    """One socket bound per interface, plus one unbound. (sock, name, network).
 
     Binding to the interface's own address is what makes this work on an Android
     hotspot: an unbound UDP socket there is routed onto the default network
     (mobile data), so a broadcast aimed at the AP subnet silently leaves via the
     wrong NIC and nothing ever answers.
     """
-    socks: list[tuple[socket.socket, str | None]] = []
-    for name, ip, _brd, _plen in ifaces:
+    socks: list[tuple[socket.socket, str | None, object]] = []
+    for name, ip, brd, plen in ifaces:
         if ip == "0.0.0.0":      # a --subnet we hold no address on; unbound covers it
             continue
         try:
+            net = ipaddress.ip_network(f"{brd}/{plen}", strict=False)
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((ip, 0))
             s.setblocking(False)
-            socks.append((s, name))
-        except OSError:
+            socks.append((s, name, net))
+        except (OSError, ValueError):
             continue
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("", 0))
     s.setblocking(False)
-    socks.append((s, None))
+    socks.append((s, None, None))
     return socks
 
 
+def senders_for(socks, addr: str):
+    """The socket(s) that should carry a probe aimed at `addr`.
+
+    Sending every probe from every socket is what makes this expensive on a
+    phone: a directed broadcast for the AP subnet emitted from the mobile-data
+    socket is both nonsense and billable, and discovery repeats every 10s for as
+    long as the camera is missing. So each target goes out only the interface
+    that can actually reach it.
+    """
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return [s for s, _n, net in socks if net is None]
+
+    if ip == ipaddress.ip_address("255.255.255.255"):
+        # Limited broadcast: emit on each real LAN, never up the metered link.
+        lan = [s for s, _n, net in socks if net is not None and net.prefixlen >= LAN_MAX_PREFIX]
+        return lan or [s for s, _n, net in socks if net is None]
+
+    match = [s for s, _n, net in socks
+             if net is not None and net.prefixlen >= LAN_MAX_PREFIX and ip in net]
+    return match or [s for s, _n, net in socks if net is None]
+
+
 def send_probes(socks, targets: list[str], ports=LAN_SEARCH_PORTS) -> None:
+    routed = [(addr, senders_for(socks, addr)) for addr in targets]
     for _label, payload in PROBES:
         for wire in (payload, xor1_encode(payload)):
-            for sock, _name in socks:
-                for addr in targets:
+            for addr, senders in routed:
+                for sock in senders:
                     for port in ports:
                         try:
                             sock.sendto(wire, (addr, port))
@@ -381,7 +413,10 @@ def main() -> int:
 
     ifaces = interfaces(args.subnet)
     socks = open_sockets(ifaces)
-    targets = sorted({b for _n, _i, b, _p in ifaces} | {"255.255.255.255"} | set(args.broadcast))
+    # Only real LANs get a directed broadcast — a /8 mobile-data link has no
+    # meaningful broadcast address and charges us for the attempt.
+    targets = sorted({b for _n, _i, b, p in ifaces if p >= LAN_MAX_PREFIX}
+                     | {"255.255.255.255"} | set(args.broadcast))
 
     say("[*] interfaces: " + (", ".join(f"{n}={i}/{p} brd {b}" for n, i, b, p in ifaces) or "none found!"))
     say(f"[*] broadcasting {len(PROBES)} probe types (plain + xor1) to {targets}")
@@ -394,7 +429,7 @@ def main() -> int:
         """Drain replies until `deadline`. True = we found what --uid asked for."""
         nonlocal result_ip
         while time.time() < deadline:
-            ready, _, _ = select.select([s for s, _ in socks], [], [],
+            ready, _, _ = select.select([s for s, _n, _net in socks], [], [],
                                         min(0.4, max(0.0, deadline - time.time())))
             for sock in ready:
                 try:
@@ -436,7 +471,7 @@ def main() -> int:
             send_probes(socks, hosts, ports=[32108])
             listen(time.time() + max(args.timeout, 3.0))
 
-    for sock, _ in socks:
+    for sock, _n, _net in socks:
         sock.close()
 
     if args.print_ip and result_ip:
