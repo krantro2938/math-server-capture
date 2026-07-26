@@ -36,6 +36,19 @@ log = logging.getLogger("lookcam")
 def _patched_parse(data):
     if len(data) >= 2 and data[0] == CAM_MAGIC and data[1] == 0x43:
         return Packet(PacketType.P2pRdy, data[4:])
+    # Never let aiopppp command-parse channel 0. It sniffs every DRW payload for
+    # a "\x11\x0a" command preamble regardless of channel — but on this firmware
+    # channel 0 is VIDEO, so compressed bytes hit that pattern by chance roughly
+    # once per 65536 packets. Usually it just logs "Failed to parse binary
+    # command" and hands the payload back intact (noisy, harmless); but when the
+    # following two bytes also happen to be a valid command id, it returns a
+    # re-encoded BinaryCmdPkt instead, silently substituting garbage for a video
+    # chunk. At ~244 packets/s that lands about once a day — a corrupted frame
+    # from nowhere, with nothing in the log to explain it.
+    if len(data) >= 8 and data[0] == CAM_MAGIC and data[1] == PacketType.Drw.value:
+        body = data[4:]
+        if body[0] == 0xD1 and body[1] == 0:          # DRW header, channel 0
+            return DrwPkt(0, struct.unpack(">H", body[2:4])[0], body[4:])
     return _orig_parse(data)
 _session.parse_packet = _patched_parse
 
@@ -60,6 +73,8 @@ class StreamSession(JsonSession):
         self.userid = 0
         self.frames = 0
         self.vbytes = 0
+        self.gaps = 0                   # lost-packet resyncs
+        self._expect = None             # next expected video DRW idx
         self.last_video = time.monotonic()
 
     async def _send_cmd(self, obj):
@@ -116,6 +131,26 @@ class StreamSession(JsonSession):
             self._recent_set.discard(self._recent[0])
         self._recent.append(idx)
         self._recent_set.add(idx)
+
+        # Gap detection. This transport is UDP with no recovery of its own: if a
+        # video DRW packet is simply lost, the byte stream gets a hole, and
+        # splicing across it yields NALUs with nonsense headers ("Failed to
+        # parse header of NALU (type 43)") that the decoder never resyncs from.
+        # The result is a permanently black feed from a single lost packet, so
+        # drop the partial frame and re-gate on the next keyframe instead —
+        # ~1 GOP of black rather than an unbounded one.
+        if self._expect is not None:
+            ahead = (idx - self._expect) & 0xFFFF
+            if ahead and ahead < 1024:                 # forward jump = lost packets
+                self.gaps += 1
+                log.warning("lost %d video packet(s) at idx %d — resyncing on "
+                            "next keyframe (%d gaps this session)",
+                            ahead, idx, self.gaps)
+                self._vbuf.clear()
+                self._started = False
+            elif ahead >= 1024:                        # far behind = late/reordered
+                return                                 # too stale to splice in
+        self._expect = (idx + 1) & 0xFFFF
         self._vbuf += chunk
         while True:
             m1 = self._vbuf.find(VID_MARK)
@@ -200,7 +235,8 @@ async def amain(args, sink):
             sess.stop()
         except Exception:
             pass
-        log.info("captured %d frames / %d HEVC bytes this session", sess.frames, sess.vbytes)
+        log.info("captured %d frames / %d HEVC bytes / %d packet-loss resyncs "
+                 "this session", sess.frames, sess.vbytes, sess.gaps)
         if deadline and time.monotonic() >= deadline:
             break
         log.info("reconnecting in 3s...")
