@@ -40,11 +40,19 @@ while true; do
   # segment length with it. -force_key_frames pins keyframes to real seconds,
   # and scenecut is disabled so nothing inserts extras in between (irregular
   # segments upset LL-HLS part timing).
+  #
+  # -r/-fps_mode cfr pin the OUTPUT rate. Without them ffmpeg inferred a rate
+  # from the phone's wallclock timestamps and landed on ~49fps, tripling every
+  # frame from a 15fps camera: the bitrate got spread over 3x the frames it
+  # should cover (visibly worse picture for the same bandwidth), and the stream
+  # advertised 1920x1080@49fps, which is enough for a stricter browser's
+  # MediaSource check to reject the init segment and render nothing at all.
   ffmpeg -hide_banner -loglevel warning \
     -fflags nobuffer -flags low_delay -avioflags direct \
     -probesize 500000 -analyzeduration 500000 \
     -rtsp_transport tcp -i "$SRC" \
     -c:v libx264 -preset "$PRESET" -tune zerolatency -b:v "$BITRATE" \
+    -r "$FPS" -fps_mode cfr \
     -g "$GOP_FRAMES" -keyint_min "$GOP_FRAMES" -sc_threshold 0 \
     -force_key_frames "expr:gte(t,n_forced*${GOP_SECONDS})" \
     -pix_fmt yuv420p -flush_packets 1 \

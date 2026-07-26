@@ -130,27 +130,53 @@ function stopLive() { if (hls) { hls.destroy(); hls = null; } liveVideo.removeAt
 function goLive() {
   const v = liveVideo;
   try {
+    let target = null;
     if (hls && typeof hls.liveSyncPosition === "number" && isFinite(hls.liveSyncPosition)) {
-      v.currentTime = hls.liveSyncPosition;
+      target = hls.liveSyncPosition;
     } else if (v.seekable && v.seekable.length) {
-      v.currentTime = v.seekable.end(v.seekable.length - 1);
+      target = v.seekable.end(v.seekable.length - 1);
     }
+    // Never seek past what is actually buffered. With LL-HLS the sync position
+    // sits only ~0.5s from the edge, so on the very first fragment it can land
+    // beyond the buffer — and a video element parked in a hole just shows black
+    // forever, with no error and no recovery. Clamp into the buffered range.
+    if (target !== null && v.buffered && v.buffered.length) {
+      const end = v.buffered.end(v.buffered.length - 1);
+      const start = v.buffered.start(0);
+      target = Math.max(start, Math.min(target, end - 0.1));
+    }
+    if (target !== null && isFinite(target) && target >= 0) v.currentTime = target;
     v.play().catch(() => {});
   } catch (e) {}
 }
 
-// Show how far behind live we are, and highlight the button when drifting.
-function updateLiveLag() {
-  const v = liveVideo, btn = $("#golive");
-  if (!btn || $("#view-live").classList.contains("hidden")) return;
-  let edge = null;
-  if (hls && isFinite(hls.liveSyncPosition)) edge = hls.liveSyncPosition;
-  else if (v.seekable && v.seekable.length) edge = v.seekable.end(v.seekable.length - 1);
-  if (edge != null) {
-    const lag = Math.max(0, edge - v.currentTime);
-    btn.classList.toggle("behind", lag > 4);
-    btn.textContent = lag > 4 ? `● GO LIVE (−${lag.toFixed(0)}s)` : "● LIVE";
+// Show how far behind live we REALLY are.
+//
+// This used to compare currentTime against hls.liveSyncPosition — but that is
+// the position hls.js is deliberately aiming for, so sitting exactly on target
+// read as "0s behind" no matter how stale the picture actually was. It would
+// happily show "LIVE" on a four-second-old image. Measure against wall-clock
+// instead, via the PROGRAM-DATE-TIME the server stamps into every segment:
+// that is true glass-to-glass (minus the camera's own internal delay).
+function trueLatency() {
+  if (!hls) return null;
+  // hls.js computes this itself in lowLatencyMode; trust it when present.
+  if (typeof hls.latency === "number" && isFinite(hls.latency) && hls.latency > 0) {
+    return hls.latency;
   }
+  // Fallback: the wall-clock time of the frame on screen right now.
+  const d = hls.playingDate;
+  if (d instanceof Date && !isNaN(d)) return (Date.now() - d.getTime()) / 1000;
+  return null;
+}
+
+function updateLiveLag() {
+  const btn = $("#golive");
+  if (!btn || $("#view-live").classList.contains("hidden")) return;
+  const lag = trueLatency();
+  if (lag == null) { btn.textContent = "● LIVE"; return; }
+  btn.classList.toggle("behind", lag > 3);
+  btn.textContent = `● LIVE (${lag.toFixed(1)}s)`;
 }
 setInterval(updateLiveLag, 1000);
 
