@@ -63,7 +63,16 @@ main() {
     rotate_log
     log "starting capture pipeline"
     bash "$REPO/run/capture.sh"
-    log "capture exited (rc=$?) — restarting in ${RESTART_DELAY}s"
+    rc=$?
+    # 78 = EX_CONFIG: a placeholder password or host that no amount of retrying
+    # will fix. Back right off so the log stays readable until someone edits the
+    # config, instead of reprinting the same error every 5s.
+    if [ "$rc" = 78 ]; then
+      log "capture exited (rc=78: config needs editing) — re-checking in ${CONFIG_RETRY:-60}s"
+      sleep "${CONFIG_RETRY:-60}"
+      continue
+    fi
+    log "capture exited (rc=$rc) — restarting in ${RESTART_DELAY}s"
     sleep "$RESTART_DELAY"
   done
 }

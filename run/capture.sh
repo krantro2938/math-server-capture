@@ -31,6 +31,23 @@ if [ -f "$CONF" ]; then . "$CONF"; else echo "[!] missing $CONF"; exit 1; fi
 PYTHON="./.venv/bin/python"; [ -x "$PYTHON" ] || PYTHON="python3"
 command -v ffmpeg >/dev/null || { echo "[!] ffmpeg not installed"; exit 1; }
 
+# The :? guards above only catch an *empty* value — and run/config.env ships a
+# CHANGE_ME placeholder, so they never fired. The result was the worst possible
+# failure shape: discovery worked, the camera logged in and streamed, and only
+# the last hop died, with an opaque SRT "I/O error" repeating forever. Reject
+# placeholders up front instead, before we touch the camera at all.
+# 78 = EX_CONFIG: the supervisor treats it as "stop hammering, a human must fix
+# this" rather than a transient fault to retry in 5s.
+for _v in PUBLISH_PASS VPS_HOST STREAM_KEY; do
+  case "$(eval "printf '%s' \"\$$_v\"")" in
+    *CHANGE_ME*|*change-me*|*example.com*)
+      echo "[!] $_v is still a placeholder — edit $CONF"
+      echo "    PUBLISH_PASS must equal PUBLISH_PASS in the VPS's vps/docker/.env"
+      echo "    (bare-metal: the 'publisher' pass in /opt/mediamtx/mediamtx.yml)."
+      exit 78 ;;
+  esac
+done
+
 case "$MODE" in
   h264)
     # Quality + low latency: CRF keeps detail close to the camera's native HEVC,
