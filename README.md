@@ -128,10 +128,16 @@ valid test of the restart policy.
 
 Phone specifics worth doing once: Termux + **Termux:Boot** from F-Droid (not
 Play Store), Termux set to **Unrestricted** battery, hotspot's "turn off when no
-devices connected" **disabled**, and the phone on a charger. If discovery can't
-see the camera on the hotspot, set `EXTRA_BROADCAST="192.168.43.255"` in
-`run/config.local.env` — Android's AP interface doesn't always show up in
-`ip addr`, and the phone's default route points at mobile data.
+devices connected" **disabled**, and the phone on a charger.
+
+If discovery can't see the camera, run `python3 discover.py -v --timeout 10`
+(without `--print-ip`) and read the first line: it lists every interface probed
+and every device that answered, with the UID it reported. Two things it handles
+by itself that used to need manual help — broadcast being routed onto Android's
+mobile-data default route (it now sends from a socket bound to each interface),
+and APs that drop client-to-client broadcast (it falls back to unicast-probing
+every host on the attached /24s). `EXTRA_BROADCAST` in `run/config.local.env`
+remains as a last resort for when the AP interface is missing from `ip addr`.
 
 ## Files
 

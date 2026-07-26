@@ -61,8 +61,16 @@ find_camera() {
   for b in $EXTRA_BROADCAST; do args+=(--broadcast "$b"); done
   while true; do
     try=$((try + 1))
-    if ip="$("$PYTHON" discover.py --print-ip --timeout "$DISCOVER_TIMEOUT" "${args[@]}" 2>/dev/null)" \
-       && [ -n "$ip" ]; then
+    # Let discovery's own diagnostics through on the FIRST attempt only: they
+    # name the interfaces probed and any device that answered with a different
+    # UID — which is exactly what you need to see when nothing is found — but
+    # repeating that every 10s forever would bury the log.
+    if [ "$try" = 1 ]; then
+      ip="$("$PYTHON" discover.py --print-ip --timeout "$DISCOVER_TIMEOUT" "${args[@]}")"
+    else
+      ip="$("$PYTHON" discover.py --print-ip --timeout "$DISCOVER_TIMEOUT" "${args[@]}" 2>/dev/null)"
+    fi
+    if [ -n "$ip" ]; then
       echo "$ip"; return 0
     fi
     echo "[.] camera not on the network yet (attempt $try) — retrying in ${DISCOVER_RETRY}s..." >&2
