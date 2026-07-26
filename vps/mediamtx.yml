@@ -23,7 +23,15 @@ hls: yes
 hlsAddress: 127.0.0.1:8888         # the gateway reads live HLS here
 hlsVariant: lowLatency             # LL-HLS: ~2-3s instead of ~5-6s
 hlsSegmentDuration: 1s
-hlsPartDuration: 200ms
+# 133ms == 2 frames at 15fps, and that exactness is the point. gohlslib does NOT
+# use this value directly: to satisfy an iOS rule ("part durations must be >=85%
+# of PART-TARGET") it rounds up in 5ms steps until the value is compatible with
+# the sample duration. At 15fps a sample is 66.667ms, so the old 200ms was
+# rounded up to 230ms and parts ended up holding FOUR frames = 267ms — a third
+# more than configured. PART-HOLD-BACK is 2.5x that, so the client was told to
+# stay 667ms back. 133ms lands on 2 frames exactly: PART-TARGET 133ms,
+# hold-back ~333ms. Re-check this if FPS ever changes.
+hlsPartDuration: 133ms
 hlsSegmentCount: 30                # ~30s of scrub-back in the Live tab (full
                                    # history lives in recordings, via the DVR tab)
 webrtc: no                         # off for now (needs public UDP+ICE); HLS covers live

@@ -36,6 +36,14 @@
   button.btn:hover { border-color: #3b82f6; }
   button.golive { font-weight: 600; color: #f87171; border-color: #3a2426; }
   button.golive.behind { background: #ef4444; color: #fff; border-color: #ef4444; }
+  /* Always-on latency readout. Fixed min-width + tabular figures so the row
+     doesn't twitch as the number changes twice a second. */
+  .lag { font-size: 13px; font-variant-numeric: tabular-nums; min-width: 96px;
+         padding: 5px 9px; border-radius: 7px; border: 1px solid #2b2f37;
+         background: #14171c; color: #8b909a; cursor: help; }
+  .lag.ok   { color: #4ade80; border-color: #1e3a2a; }
+  .lag.warn { color: #fbbf24; border-color: #3a3320; }
+  .lag.bad  { color: #f87171; border-color: #3a2426; }
   .hint { color: #8b909a; font-size: 13px; }
   .segs { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; max-height: 46vh;
           overflow: auto; border: 1px solid #23262d; border-radius: 10px; padding: 6px; }
@@ -64,7 +72,8 @@
     <video id="live" controls autoplay muted playsinline></video>
     <div class="row">
       <button class="btn golive" id="golive" onclick="goLive()">● LIVE</button>
-      <span class="hint">HLS is a few seconds behind and you can scrub back; click to jump to the live edge.</span>
+      <span class="lag" id="lag">— s behind</span>
+      <span class="hint">Age of the frame on screen. You can scrub back; click LIVE to jump to the edge.</span>
     </div>
   </section>
 
@@ -96,19 +105,31 @@ function startLive() {
     if (hls) hls.destroy();
     hls = new Hls({
       lowLatencyMode: true,
-      // Explicit hold-back, in SECONDS, and deliberately not a segment count.
+      // DO NOT set liveSyncDuration/liveSyncDurationCount here. That is the
+      // whole latency bug, and it is not obvious from the docs:
       //
-      // Leaving this unset is supposed to let hls.js honour the playlist's
-      // PART-HOLD-BACK (0.5125s). Measured against the real server, it does
-      // not: MediaMTX advertises PART-HOLD-BACK at 2.5x PART-TARGET where the
-      // spec demands at least 3x, and hls.js quietly declines it and falls back
-      // to its default of THREE segments. With 1s segments that is a 3s
-      // hold-back — which, on top of ~0.7s of pipeline, is precisely the ~3.5s
-      // observed. One second is still comfortably more than two parts, so it
-      // keeps a real buffer while capping the client's contribution at 1s
-      // whether or not low-latency sync engages.
-      liveSyncDuration: 1.0,
-      liveMaxLatencyDurationCount: 6,   // still bail forward if we fall way behind
+      //   let targetLatency = lowLatencyMode ? partHoldBack || holdBack : holdBack;
+      //   if (… || userConfig.liveSyncDuration || userConfig.liveSyncDurationCount …)
+      //     targetLatency = liveSyncDuration ?? liveSyncDurationCount * targetduration;
+      //
+      // Merely *setting* either key makes hls.js throw away the playlist's
+      // PART-HOLD-BACK and fall back to a multiple of EXT-X-TARGETDURATION.
+      // TARGETDURATION is an integer number of seconds, so the old
+      // `liveSyncDurationCount: 2` parked us >=2.0s behind the edge instead of
+      // the 0.667s the server actually advertises — most of the ~3s we saw.
+      //
+      // It also got worse over time and never recovered: gohlslib raises
+      // TARGETDURATION when a segment runs long but never lowers it again, so a
+      // single 2s segment (a reconnect, a keyframe hiccup) pinned the client at
+      // 4.0s until MediaMTX itself restarted.
+      //
+      // The two families are mutually exclusive, and mixing them is fatal, not
+      // ignored: `new Hls()` THROWS "don't mix up liveSyncDurationCount/
+      // liveMaxLatencyDurationCount and liveSyncDuration/liveMaxLatencyDuration",
+      // which leaves hls null and the player black. liveMaxLatencyDurationCount
+      // cannot be kept on its own either — without liveSyncDurationCount it
+      // trips a second check. So: set neither, and let PART-HOLD-BACK win.
+      //
       // Nudge playback up to 1.05x to close a small gap rather than jumping,
       // which is far less jarring than a seek on a live view.
       maxLiveSyncPlaybackRate: 1.05,
@@ -164,27 +185,62 @@ function goLive() {
 // happily show "LIVE" on a four-second-old image. Measure against wall-clock
 // instead, via the PROGRAM-DATE-TIME the server stamps into every segment:
 // that is true glass-to-glass (minus the camera's own internal delay).
+// Order matters, and the obvious choice is the wrong one. hls.latency looks
+// authoritative but is only `(levelDetails.edge + age) - currentTime` — the
+// distance from the PLAYLIST edge. It is blind to every hop upstream of the
+// packager (camera, capture box, SRT, transcode), so it happily reads ~1s while
+// the picture on screen is three seconds old. Preferring it also made the
+// PROGRAM-DATE-TIME branch below dead code, since it is ~always > 0 once
+// playing. So: wall clock first, hls.latency only as a last resort, clearly
+// labelled as the weaker measurement.
 function trueLatency() {
-  if (!hls) return null;
-  // hls.js computes this itself in lowLatencyMode; trust it when present.
-  if (typeof hls.latency === "number" && isFinite(hls.latency) && hls.latency > 0) {
-    return hls.latency;
+  // MediaMTX stamps EXT-X-PROGRAM-DATE-TIME on every segment, so this is the
+  // real capture time of the frame being shown — true glass-to-glass, minus
+  // only the camera's own internal delay.
+  if (hls) {
+    const d = hls.playingDate;
+    if (d instanceof Date && !isNaN(d)) return { s: (Date.now() - d.getTime()) / 1000, real: true };
+    if (typeof hls.latency === "number" && isFinite(hls.latency) && hls.latency > 0) {
+      return { s: hls.latency, real: false };
+    }
+    return null;
   }
-  // Fallback: the wall-clock time of the frame on screen right now.
-  const d = hls.playingDate;
-  if (d instanceof Date && !isNaN(d)) return (Date.now() - d.getTime()) / 1000;
+  // Safari native HLS: same idea via the standard getStartDate().
+  if (typeof liveVideo.getStartDate === "function") {
+    const start = liveVideo.getStartDate();
+    if (start instanceof Date && !isNaN(start) && liveVideo.currentTime > 0) {
+      return { s: (Date.now() - (start.getTime() + liveVideo.currentTime * 1000)) / 1000, real: true };
+    }
+  }
   return null;
 }
 
+// The readout is its own element next to the button, not the button's label, so
+// it is on screen at all times — including while paused, scrubbed back, or
+// still connecting — instead of only when a number happens to be available.
 function updateLiveLag() {
-  const btn = $("#golive");
-  if (!btn || $("#view-live").classList.contains("hidden")) return;
-  const lag = trueLatency();
-  if (lag == null) { btn.textContent = "● LIVE"; return; }
-  btn.classList.toggle("behind", lag > 3);
-  btn.textContent = `● LIVE (${lag.toFixed(1)}s)`;
+  const btn = $("#golive"), out = $("#lag");
+  if (!out || $("#view-live").classList.contains("hidden")) return;
+  const r = trueLatency();
+  if (r == null || !isFinite(r.s)) {
+    out.textContent = "— s behind";
+    out.className = "lag";
+    if (btn) btn.classList.remove("behind");
+    return;
+  }
+  // Clamp: a negative reading just means the client's clock is ahead of the
+  // server's, which is a clock-sync artefact and not something to show.
+  const lag = Math.max(0, r.s);
+  out.textContent = `${lag.toFixed(1)}s behind` + (r.real ? "" : " (edge)");
+  out.className = "lag " + (lag <= 1.5 ? "ok" : lag <= 3 ? "warn" : "bad");
+  out.title = r.real
+    ? "Wall-clock age of the frame on screen, from EXT-X-PROGRAM-DATE-TIME."
+    : "Distance from the playlist edge only — excludes camera/capture/transcode delay.";
+  if (btn) btn.classList.toggle("behind", lag > 3);
 }
-setInterval(updateLiveLag, 1000);
+// 500ms: fast enough that the number tracks a Go-live jump instead of lagging
+// a second behind the thing it is measuring.
+setInterval(updateLiveLag, 500);
 
 document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));

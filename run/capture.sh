@@ -128,8 +128,17 @@ while true; do
   "$PYTHON" lookcam_stream.py -a "$CAM_ADDR" -p "$CAM_PASS" --stream "$STREAM" --pipe \
     > "$FIFO" &
   PY_PID=$!
+  # -probesize/-analyzeduration are capped deliberately. ffmpeg's defaults are
+  # 5MB / 5s, and -fflags nobuffer does not override them: on a raw HEVC stream
+  # it sits there swallowing seconds of video before it emits anything, and
+  # (with -use_wallclock_as_timestamps) then flushes a burst already several
+  # seconds old. That is a startup cost, but this pipeline restarts constantly —
+  # every camera drop, every re-find, every supervisor retry — so it is really a
+  # recurring one. Raw HEVC needs only the first VPS/SPS/PPS + a frame to be
+  # probed, which fits in far less than 200KB.
   ffmpeg -hide_banner -loglevel warning \
       -fflags +genpts+nobuffer -flags low_delay \
+      -probesize 200000 -analyzeduration 200000 \
       -use_wallclock_as_timestamps 1 \
       -f hevc -i "$FIFO" "${PUSH[@]}" &
   FF_PID=$!
