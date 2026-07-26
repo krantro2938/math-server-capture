@@ -96,12 +96,18 @@ function startLive() {
     if (hls) hls.destroy();
     hls = new Hls({
       lowLatencyMode: true,
-      // Deliberately NO liveSyncDurationCount here. Setting it overrides the
-      // playlist's PART-HOLD-BACK, which is what actually makes LL-HLS low
-      // latency — the old value of 2 parked us two *segments* (~5s) behind the
-      // edge and quietly cancelled the low-latency mode configured on the
-      // server. Left unset, hls.js honours MediaMTX's PART-HOLD-BACK
-      // (3 x hlsPartDuration = 600ms).
+      // Explicit hold-back, in SECONDS, and deliberately not a segment count.
+      //
+      // Leaving this unset is supposed to let hls.js honour the playlist's
+      // PART-HOLD-BACK (0.5125s). Measured against the real server, it does
+      // not: MediaMTX advertises PART-HOLD-BACK at 2.5x PART-TARGET where the
+      // spec demands at least 3x, and hls.js quietly declines it and falls back
+      // to its default of THREE segments. With 1s segments that is a 3s
+      // hold-back — which, on top of ~0.7s of pipeline, is precisely the ~3.5s
+      // observed. One second is still comfortably more than two parts, so it
+      // keeps a real buffer while capping the client's contribution at 1s
+      // whether or not low-latency sync engages.
+      liveSyncDuration: 1.0,
       liveMaxLatencyDurationCount: 6,   // still bail forward if we fall way behind
       // Nudge playback up to 1.05x to close a small gap rather than jumping,
       // which is far less jarring than a seek on a live view.
