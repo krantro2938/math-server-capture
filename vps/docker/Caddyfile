@@ -27,3 +27,15 @@
 		flush_interval -1
 	}
 }
+
+# The Even Realities document server, if it's deployed. It lives in its own
+# repo and its own compose project, and joins this stack's network so it can be
+# reached here by service name. Same .localhost default as above, so this is a
+# no-op unless EVENS_DOMAIN is set.
+{$EVENS_DOMAIN:evens.localhost} {
+	reverse_proxy evens:8787 {
+		# /events and /assignment/events are SSE — the glasses rely on those
+		# pushes to know a document changed.
+		flush_interval -1
+	}
+}

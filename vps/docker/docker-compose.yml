@@ -158,6 +158,9 @@ services:
       # repeated here rather than left to the Caddyfile, so the value is never
       # an empty string — an empty site address is a Caddy startup error.
       ASSIGNMENT_DOMAIN: ${ASSIGNMENT_DOMAIN:-assignment.localhost}
+      # Vhost for the Even Realities document server, which is deployed from its
+      # own repo onto this stack's network. Unset = no route, no ACME attempt.
+      EVENS_DOMAIN: ${EVENS_DOMAIN:-evens.localhost}
 
 volumes:
   caddy_data:
