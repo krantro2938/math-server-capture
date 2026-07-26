@@ -149,6 +149,16 @@ function startLive() {
       // jump forward rather than an unbounded slide.
       liveSyncDuration: 0.8,
       liveMaxLatencyDuration: 4,
+      // Per-stall penalty. hls.js defaults this to a FULL SECOND, capped at
+      // targetduration — so with 1s segments, a single stall anywhere in the
+      // session pushed targetLatency from 0.8 straight to 1.8 and pinned it
+      // there: stallCount only resets in onManifestLoading, i.e. on a page
+      // reload, never on recovery. That alone was most of the observed 3-4s.
+      //
+      // 0.2 still backs off when the network genuinely can't hold the target
+      // (which is the point of the mechanism) but makes one hiccup cost 200ms
+      // instead of a second, and takes 5 stalls rather than 1 to saturate.
+      liveSyncOnStallIncrease: 0.2,
       // Nudge playback up to 1.05x to close a small gap rather than jumping,
       // which is far less jarring than a seek on a live view.
       maxLiveSyncPlaybackRate: 1.05,
