@@ -52,10 +52,17 @@ samples.sort()
 med = statistics.median(samples)
 print(f"{host}:{port}  n={len(samples)} failed={failed}")
 print(f"  min {samples[0]:.0f} ms | median {med:.0f} ms | max {samples[-1]:.0f} ms")
-# Jitter matters as much as the median on mobile data: SRT has to cover the
-# late tail, not the typical case, so size off the worst seen, not the median.
-suggested = max(300000, int(round(max(med * 4, samples[-1] * 2) / 50000.0)) * 50000)
-print(f"\n  SRT_LATENCY=\"{suggested}\"   # in run/config.local.env, then restart capture")
+
+# Everything above is in MILLISECONDS; SRT_LATENCY is in MICROseconds. Convert
+# once, explicitly, and do the rounding in the target unit -- mixing the two is
+# an easy mistake that silently pins every suggestion to the floor.
+# Jitter matters as much as the median on mobile data: SRT has to cover the late
+# tail, not the typical case, so size off the worst sample as well as the median.
+need_ms = max(med * 4, samples[-1] * 2)
+suggested_us = int(round(need_ms * 1000 / 50000.0)) * 50000   # nearest 50ms
+suggested_us = max(300000, suggested_us)                      # never below 300ms
+print(f"\n  SRT_LATENCY=\"{suggested_us}\"   # {suggested_us // 1000} ms"
+      f" -- in run/config.local.env, then restart capture")
 if samples[-1] > med * 3:
     print("  (high jitter — if grey frames persist, go one step higher)")
 PY

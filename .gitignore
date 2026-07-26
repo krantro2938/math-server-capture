@@ -33,6 +33,10 @@ scratchpad/
 *.m4s
 recordings/
 vps/docker/recordings/
+
+# Assignment reader's runtime state: state.json, the last frame, and the
+# archive of previous versions. Regenerated on every run.
+assignment/data/
 # NB: no bare `*.ts` here, however tempting for MPEG-TS dumps — it also matches
 # TypeScript, and would silently drop web/server.ts from the repo (it did once).
 # MPEG-TS only ever lands in the ignored recordings/ dirs anyway.
