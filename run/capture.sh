@@ -26,6 +26,7 @@ if [ -f "$CONF" ]; then . "$CONF"; else echo "[!] missing $CONF"; exit 1; fi
 : "${PUBLISH_PASS:?set it in $CONF}"
 : "${MODE:=copy}"           ; : "${FPS:=15}" ; : "${CRF:=20}" ; : "${MAXRATE:=5000k}"
 : "${DISCOVER_TIMEOUT:=5}"  ; : "${DISCOVER_RETRY:=10}" ; : "${EXTRA_BROADCAST:=}"
+: "${EXTRA_SUBNET:=}"
 
 PYTHON="./.venv/bin/python"; [ -x "$PYTHON" ] || PYTHON="python3"
 command -v ffmpeg >/dev/null || { echo "[!] ffmpeg not installed"; exit 1; }
@@ -59,6 +60,7 @@ find_camera() {
   local args=() ip try=0 b
   [ -n "$CAM_UID" ] && args+=(--uid "$CAM_UID")
   for b in $EXTRA_BROADCAST; do args+=(--broadcast "$b"); done
+  for b in $EXTRA_SUBNET; do args+=(--subnet "$b"); done
   while true; do
     try=$((try + 1))
     # Let discovery's own diagnostics through on the FIRST attempt only: they

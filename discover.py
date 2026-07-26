@@ -98,50 +98,120 @@ def xor1_encode(data: bytes) -> bytes:
 
 # ---- interfaces --------------------------------------------------------------
 
-def interfaces() -> list[tuple[str, str, str, int]]:
-    """[(ifname, local_ip, broadcast, prefixlen)] for every up IPv4 interface.
-
-    A device can sit on several networks at once (WiFi + hotspot AP + VPN +
-    docker bridges), so we don't guess a single "primary" one — we read them all
-    out of `ip -o -4 addr`. Loopback is skipped. Falls back to the connect()
-    trick if `ip` isn't available.
-    """
-    found: list[tuple[str, str, str, int]] = []
+def _iface_from_ip_cmd() -> list[tuple[str, str, str, int]]:
+    """Parse `ip -o -4 addr show`. The good path — on a normal Linux box."""
+    found = []
     try:
         out = subprocess.run(
             ["ip", "-o", "-4", "addr", "show"],
             capture_output=True, text=True, timeout=2,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        out = ""
+        return found
 
     for line in out.splitlines():
         parts = line.split()
         if "inet" not in parts:
             continue
-        name = parts[1]
-        cidr = parts[parts.index("inet") + 1]
         try:
-            iface = ipaddress.ip_interface(cidr)
-        except ValueError:
+            iface = ipaddress.ip_interface(parts[parts.index("inet") + 1])
+        except (ValueError, IndexError):
             continue
         if iface.ip.is_loopback:
             continue
         brd = parts[parts.index("brd") + 1] if "brd" in parts else None
-        if not brd:
-            brd = str(iface.network.broadcast_address)
-        found.append((name, str(iface.ip), brd, iface.network.prefixlen))
+        found.append((parts[1], str(iface.ip), brd or str(iface.network.broadcast_address),
+                      iface.network.prefixlen))
+    return found
 
-    if not found:  # `ip` gave us nothing usable; fall back to the trick.
+
+def _iface_from_ioctl() -> list[tuple[str, str, str, int]]:
+    """Enumerate via SIOCGIFCONF/SIOCGIFNETMASK ioctls instead of netlink.
+
+    This is the one that matters on a phone. Android blocks RTM_GETLINK for
+    unprivileged apps, so in Termux `ip addr` exits 0 having printed *nothing* —
+    silently leaving us with no interfaces and no error to notice. The old
+    connect()-to-8.8.8.8 fallback then reported only the mobile-data address,
+    which is the wrong network entirely: the camera is on the hotspot AP
+    interface, which never appeared. Plain ioctls on a UDP socket are not
+    restricted, so they still see the AP.
+    """
+    try:
+        import array
+        import fcntl
+    except ImportError:      # not POSIX
+        return []
+
+    SIOCGIFCONF, SIOCGIFNETMASK = 0x8912, 0x891B
+    ifreq_size = 40 if struct.calcsize("P") == 8 else 32
+    found = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        buf = array.array("B", b"\0" * 8192)
+        ptr, length = buf.buffer_info()
+        res = fcntl.ioctl(s.fileno(), SIOCGIFCONF, struct.pack("iL", length, ptr))
+        size = struct.unpack("iL", res)[0]
+        data = buf.tobytes()
+    except (OSError, struct.error):
+        return []
+
+    for off in range(0, size, ifreq_size):
+        try:
+            name = data[off:off + 16].split(b"\0")[0].decode()
+            ip = socket.inet_ntoa(data[off + 20:off + 24])
+        except (ValueError, OSError, UnicodeDecodeError):
+            continue
+        if ipaddress.ip_address(ip).is_loopback:
+            continue
+        try:
+            nm = fcntl.ioctl(s.fileno(), SIOCGIFNETMASK, struct.pack("16s24x", name.encode()))
+            mask = socket.inet_ntoa(nm[20:24])
+        except OSError:
+            mask = "255.255.255.0"
+        try:
+            iface = ipaddress.ip_interface(f"{ip}/{mask}")
+        except ValueError:
+            continue
+        found.append((name, ip, str(iface.network.broadcast_address), iface.network.prefixlen))
+    s.close()
+    return found
+
+
+def interfaces(extra_subnets: list[str] | None = None) -> list[tuple[str, str, str, int]]:
+    """[(ifname, local_ip, broadcast, prefixlen)] for every up IPv4 interface.
+
+    A device can sit on several networks at once (WiFi + hotspot AP + VPN +
+    docker bridges), so we don't guess a single "primary" one — we take the
+    union of what `ip` and the ioctls report, keyed by address. Loopback is
+    skipped; the connect() trick is the last resort.
+    """
+    by_ip: dict[str, tuple[str, str, str, int]] = {}
+    for entry in _iface_from_ip_cmd() + _iface_from_ioctl():
+        by_ip.setdefault(entry[1], entry)
+
+    for cidr in extra_subnets or []:
+        # An explicitly named subnet we may have no address on at all (e.g. the
+        # AP subnet when even the ioctls come up empty). Probe it from whatever
+        # source address the kernel picks.
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        mine = next((ip for ip in by_ip if ipaddress.ip_address(ip) in net), None)
+        by_ip.setdefault(str(net.broadcast_address),
+                         ("(--subnet)", mine or "0.0.0.0",
+                          str(net.broadcast_address), net.prefixlen))
+
+    if not by_ip:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
-            found.append(("?", ip, ".".join(ip.split(".")[:3] + ["255"]), 24))
+            by_ip[ip] = ("?", ip, ".".join(ip.split(".")[:3] + ["255"]), 24)
         except OSError:
             pass
-    return found
+    return list(by_ip.values())
 
 
 # ---- reply parsing -----------------------------------------------------------
@@ -228,6 +298,8 @@ def open_sockets(ifaces) -> list[tuple[socket.socket, str | None]]:
     """
     socks: list[tuple[socket.socket, str | None]] = []
     for name, ip, _brd, _plen in ifaces:
+        if ip == "0.0.0.0":      # a --subnet we hold no address on; unbound covers it
+            continue
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -259,14 +331,22 @@ def send_probes(socks, targets: list[str], ports=LAN_SEARCH_PORTS) -> None:
 
 
 def sweep_hosts(ifaces, limit: int = 1024) -> list[str]:
-    """Every unicast host address on our attached subnets (small ones only)."""
+    """Every unicast host address on our attached subnets (small ones only).
+
+    Derived from the broadcast address rather than our own, so a subnet named
+    with --subnet that we hold no address on still gets swept.
+    """
     hosts: list[str] = []
-    for _name, ip, _brd, plen in ifaces:
-        net = ipaddress.ip_network(f"{ip}/{plen}", strict=False)
+    ours = {ip for _n, ip, _b, _p in ifaces}
+    for _name, _ip, brd, plen in ifaces:
+        try:
+            net = ipaddress.ip_network(f"{brd}/{plen}", strict=False)
+        except ValueError:
+            continue
         if net.num_addresses > limit:
             continue
-        hosts.extend(str(h) for h in net.hosts() if str(h) != ip)
-    return hosts
+        hosts.extend(str(h) for h in net.hosts() if str(h) not in ours)
+    return sorted(set(hosts), key=lambda h: tuple(int(o) for o in h.split(".")))
 
 
 def main() -> int:
@@ -277,6 +357,11 @@ def main() -> int:
                     help="extra broadcast address to probe (repeatable). Useful on "
                          "Android, where the hotspot interface may not show up in "
                          "`ip addr` — e.g. --broadcast 192.168.43.255")
+    ap.add_argument("--subnet", action="append", default=[], metavar="CIDR",
+                    help="a whole network to probe AND unicast-sweep, even if we "
+                         "hold no address on it (repeatable). The escape hatch when "
+                         "interface enumeration comes up empty on Android — "
+                         "e.g. --subnet 10.158.133.0/24")
     ap.add_argument("--sweep", action="store_true",
                     help="unicast-probe every host on the attached subnets instead "
                          "of waiting for broadcast to fail first")
@@ -294,7 +379,7 @@ def main() -> int:
     def say(*a):
         print(*a, file=sys.stderr if args.print_ip else sys.stdout)
 
-    ifaces = interfaces()
+    ifaces = interfaces(args.subnet)
     socks = open_sockets(ifaces)
     targets = sorted({b for _n, _i, b, _p in ifaces} | {"255.255.255.255"} | set(args.broadcast))
 

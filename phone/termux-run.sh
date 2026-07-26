@@ -17,6 +17,8 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHON="$REPO/.venv/bin/python"; [ -x "$PYTHON" ] || PYTHON="python3"
+command -v "$PYTHON" >/dev/null 2>&1 || PYTHON="python"   # Termux ships `python`
 LOG="${LOG:-$HOME/lookcam.log}"
 MAX_LOG_BYTES=${MAX_LOG_BYTES:-5000000}     # rotate at ~5 MB, keep one old copy
 RESTART_DELAY=${RESTART_DELAY:-5}
@@ -36,13 +38,22 @@ rotate_log() {
 
 # Don't start broadcasting into the void before Android has brought WiFi/hotspot
 # up — on boot this script often wins the race against the network.
+#
+# `ip` is useless as the test here: Android blocks netlink for unprivileged apps,
+# so in Termux `ip -o -4 addr` succeeds while printing NOTHING, and this loop
+# waited forever on a phone that was online the whole time. discover.py's own
+# enumeration (ioctl-based, works on Android) is the honest check, and we cap the
+# wait either way — never block the pipeline on a test that can't answer.
 wait_for_network() {
-  command -v ip >/dev/null || return 0        # can't tell — just proceed
-  local waited=0
-  while [ -z "$(ip -o -4 addr show scope global 2>/dev/null)" ]; do
+  local waited=0 max=${NETWORK_WAIT_MAX:-120}
+  while [ "$waited" -lt "$max" ]; do
+    if "${PYTHON:-python}" -c 'import sys; sys.path.insert(0,sys.argv[1]); import discover; sys.exit(0 if discover.interfaces() else 1)' "$REPO" 2>/dev/null; then
+      return 0
+    fi
     [ $((waited % 60)) -eq 0 ] && log "waiting for a network interface..."
     sleep 5; waited=$((waited + 5))
   done
+  log "no interface detected after ${max}s — starting anyway"
 }
 
 main() {
