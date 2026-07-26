@@ -154,6 +154,10 @@ services:
       - caddy_config:/config
     environment:
       DOMAIN: ${DOMAIN:?set DOMAIN in .env, or run without --profile caddy}
+      # Optional second vhost for the assignment reader. The literal default is
+      # repeated here rather than left to the Caddyfile, so the value is never
+      # an empty string — an empty site address is a Caddy startup error.
+      ASSIGNMENT_DOMAIN: ${ASSIGNMENT_DOMAIN:-assignment.localhost}
 
 volumes:
   caddy_data:

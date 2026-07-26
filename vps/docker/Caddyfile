@@ -1,8 +1,29 @@
-# Used only by the optional `caddy` profile. {$DOMAIN} comes from .env.
-# Caddy obtains and renews the TLS cert automatically — port 80 and 443 must be
-# open and the domain's A record must point at this VPS.
+# Used only by the optional `caddy` profile. The domains come from .env.
+# Caddy obtains and renews the TLS certs automatically — port 80 and 443 must be
+# open and each domain's A record must point at this VPS.
+#
+# NOTE: the A records must be DNS-only. Behind Cloudflare's proxy (orange cloud)
+# the ACME HTTP-01 challenge is answered by Cloudflare rather than by Caddy, and
+# issuance fails.
 {$DOMAIN} {
 	# The gateway is the only thing exposed; MediaMTX stays on the internal
 	# network and is reached through it.
 	reverse_proxy web:8080
+}
+
+# The assignment reader, when it's running (`--profile assignment`). Fronting it
+# with Caddy is what lets API_TOKEN stop crossing the network in the clear, so
+# the container's own 8091 no longer needs publishing — set
+# ASSIGNMENT_BIND=127.0.0.1 in .env once this is in place.
+#
+# Defaults to assignment.localhost, for which Caddy issues an internal cert
+# instead of calling Let's Encrypt — so a deployment that doesn't set
+# ASSIGNMENT_DOMAIN gets a harmless no-op block rather than a startup error or a
+# failing ACME loop. Answers 502 while the assignment profile is down.
+{$ASSIGNMENT_DOMAIN:assignment.localhost} {
+	reverse_proxy assignment:8091 {
+		# /events is a long-lived SSE stream; buffering it would defeat the
+		# point of a live progress feed.
+		flush_interval -1
+	}
 }
