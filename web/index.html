@@ -98,38 +98,57 @@ const player = $("#player");
 let hls = null;
 function startLive() {
   const src = "/live/index.m3u8";
-  if (liveVideo.canPlayType("application/vnd.apple.mpegurl")) {
-    liveVideo.src = src;                       // Safari native HLS
-    liveVideo.addEventListener("loadedmetadata", goLive, { once: true });
-  } else if (window.Hls && Hls.isSupported()) {
+  // ORDER MATTERS, and the intuitive order is wrong.
+  //
+  // This used to test canPlayType() first and only fall back to hls.js. But
+  // canPlayType("application/vnd.apple.mpegurl") returns "maybe" on Android
+  // Chrome as well as on Safari, so nearly every browser took the native path
+  // and hls.js never loaded at all — which quietly disabled every low-latency
+  // setting below, since the native player has no latency controller.
+  //
+  // That is what made the lag GROW the longer the page stayed open: native HLS
+  // plays at exactly 1.0x from wherever it happens to be, so every stall or slow
+  // segment is added to the delay permanently and nothing ever claws it back.
+  // Minutes in, it was 6s and still climbing.
+  //
+  // So: prefer hls.js wherever it works (it reports MediaSource *and*
+  // iOS 17.1+ ManagedMediaSource), and keep native strictly as the fallback for
+  // players that have no MSE at all — mainly older iPhones.
+  if (window.Hls && Hls.isSupported()) {
     if (hls) hls.destroy();
     hls = new Hls({
       lowLatencyMode: true,
-      // DO NOT set liveSyncDuration/liveSyncDurationCount here. That is the
-      // whole latency bug, and it is not obvious from the docs:
+      // Target latency, in SECONDS. Two traps here, both worth knowing.
       //
-      //   let targetLatency = lowLatencyMode ? partHoldBack || holdBack : holdBack;
-      //   if (… || userConfig.liveSyncDuration || userConfig.liveSyncDurationCount …)
-      //     targetLatency = liveSyncDuration ?? liveSyncDurationCount * targetduration;
+      // 1. hls.js has two mutually exclusive config families — seconds
+      //    (liveSyncDuration/liveMaxLatencyDuration) and segment counts
+      //    (liveSyncDurationCount/liveMaxLatencyDurationCount). Mixing them is
+      //    fatal rather than ignored: `new Hls()` THROWS "don't mix up ...",
+      //    leaving hls null and the player black. Pick one family; this is the
+      //    seconds one, so never add a *Count key alongside these.
       //
-      // Merely *setting* either key makes hls.js throw away the playlist's
-      // PART-HOLD-BACK and fall back to a multiple of EXT-X-TARGETDURATION.
-      // TARGETDURATION is an integer number of seconds, so the old
-      // `liveSyncDurationCount: 2` parked us >=2.0s behind the edge instead of
-      // the 0.667s the server actually advertises — most of the ~3s we saw.
+      // 2. Setting either sync key at all makes hls.js discard the playlist's
+      //    PART-HOLD-BACK (0.335s here):
       //
-      // It also got worse over time and never recovered: gohlslib raises
-      // TARGETDURATION when a segment runs long but never lowers it again, so a
-      // single 2s segment (a reconnect, a keyframe hiccup) pinned the client at
-      // 4.0s until MediaMTX itself restarted.
+      //      let targetLatency = lowLatencyMode ? partHoldBack || holdBack : …;
+      //      if (… || userConfig.liveSyncDuration || userConfig.liveSyncDurationCount …)
+      //        targetLatency = liveSyncDuration ?? liveSyncDurationCount * targetduration;
       //
-      // The two families are mutually exclusive, and mixing them is fatal, not
-      // ignored: `new Hls()` THROWS "don't mix up liveSyncDurationCount/
-      // liveMaxLatencyDurationCount and liveSyncDuration/liveMaxLatencyDuration",
-      // which leaves hls null and the player black. liveMaxLatencyDurationCount
-      // cannot be kept on its own either — without liveSyncDurationCount it
-      // trips a second check. So: set neither, and let PART-HOLD-BACK win.
+      //    That is how the old `liveSyncDurationCount: 2` parked us >=2s behind
+      //    the edge — 2 x EXT-X-TARGETDURATION, which is an integer number of
+      //    seconds — instead of the 0.335s the server advertises.
       //
+      // Inheriting PART-HOLD-BACK by setting neither key looks like the clean
+      // answer, but liveMaxLatencyDurationCount then defaults to Infinity, so
+      // there is no upper bound at all; and catch-up only engages within
+      // `targetLatency + targetduration` (~1.3s). One stall past that and it
+      // drifts forever with nothing to pull it back.
+      //
+      // So: pick both explicitly. 0.8s is comfortable headroom over 0.335s,
+      // giving a 1.8s catch-up window, and 4s is a hard ceiling that forces a
+      // jump forward rather than an unbounded slide.
+      liveSyncDuration: 0.8,
+      liveMaxLatencyDuration: 4,
       // Nudge playback up to 1.05x to close a small gap rather than jumping,
       // which is far less jarring than a seek on a live view.
       maxLiveSyncPlaybackRate: 1.05,
@@ -147,15 +166,57 @@ function startLive() {
     // Jump to the live edge ONCE when it first starts — but never again, so you
     // can freely scrub back into the buffered window without being yanked forward.
     hls.once(Hls.Events.FRAG_BUFFERED, goLive);
+  } else if (liveVideo.canPlayType("application/vnd.apple.mpegurl")) {
+    liveVideo.src = src;                       // native HLS (older iOS, no MSE)
+    liveVideo.addEventListener("loadedmetadata", goLive, { once: true });
+    startDriftWatch();                         // native has no catch-up of its own
   } else {
     $("#view-live").insertAdjacentHTML("beforeend", "<p class=hint>HLS unsupported in this browser.</p>");
   }
 }
-function stopLive() { if (hls) { hls.destroy(); hls = null; } liveVideo.removeAttribute("src"); liveVideo.load(); }
+function stopLive() {
+  if (hls) { hls.destroy(); hls = null; }
+  stopDriftWatch();
+  liveVideo.removeAttribute("src"); liveVideo.load();
+}
+
+// ---------- native-HLS drift watchdog ----------
+// Only for the native fallback. hls.js corrects drift by itself (that is what
+// maxLiveSyncPlaybackRate/liveMaxLatencyDuration are for); the native player
+// does not, so without this the delay grows without limit for as long as the
+// page is open.
+//
+// It must not fight the user: scrubbing back into the buffer is a feature here,
+// so a manual seek disarms the watchdog until "LIVE" is clicked again. We can
+// tell our own seeks from the user's with a flag, since both fire `seeked`.
+let driftTimer = null, userScrubbed = false, ourSeek = false;
+const DRIFT_MAX = 3.0;      // let it wander this far behind the edge...
+const DRIFT_TARGET = 1.0;   // ...then put it back here
+
+liveVideo.addEventListener("seeked", () => {
+  if (ourSeek) { ourSeek = false; return; }
+  userScrubbed = true;      // re-armed by goLive()
+});
+
+function startDriftWatch() {
+  stopDriftWatch();
+  driftTimer = setInterval(() => {
+    if (userScrubbed || liveVideo.paused || liveVideo.seeking) return;
+    const s = liveVideo.seekable;
+    if (!s || !s.length) return;
+    const edge = s.end(s.length - 1);
+    if (edge - liveVideo.currentTime > DRIFT_MAX) {
+      ourSeek = true;
+      liveVideo.currentTime = edge - DRIFT_TARGET;
+    }
+  }, 2000);
+}
+function stopDriftWatch() { if (driftTimer) { clearInterval(driftTimer); driftTimer = null; } }
 
 // Jump to the live edge (used by the "Go Live" button and on load).
 function goLive() {
   const v = liveVideo;
+  userScrubbed = false;   // clicking LIVE re-arms the native drift watchdog
   try {
     let target = null;
     if (hls && typeof hls.liveSyncPosition === "number" && isFinite(hls.liveSyncPosition)) {
@@ -172,19 +233,13 @@ function goLive() {
       const start = v.buffered.start(0);
       target = Math.max(start, Math.min(target, end - 0.1));
     }
-    if (target !== null && isFinite(target) && target >= 0) v.currentTime = target;
+    if (target !== null && isFinite(target) && target >= 0) { ourSeek = true; v.currentTime = target; }
     v.play().catch(() => {});
   } catch (e) {}
 }
 
 // Show how far behind live we REALLY are.
 //
-// This used to compare currentTime against hls.liveSyncPosition — but that is
-// the position hls.js is deliberately aiming for, so sitting exactly on target
-// read as "0s behind" no matter how stale the picture actually was. It would
-// happily show "LIVE" on a four-second-old image. Measure against wall-clock
-// instead, via the PROGRAM-DATE-TIME the server stamps into every segment:
-// that is true glass-to-glass (minus the camera's own internal delay).
 // Order matters, and the obvious choice is the wrong one. hls.latency looks
 // authoritative but is only `(levelDetails.edge + age) - currentTime` — the
 // distance from the PLAYLIST edge. It is blind to every hop upstream of the
@@ -205,12 +260,21 @@ function trueLatency() {
     }
     return null;
   }
-  // Safari native HLS: same idea via the standard getStartDate().
+  // Native HLS: same idea via the standard getStartDate(), where it exists.
+  // Safari has it; Android Chrome does not, which is why this used to come back
+  // empty and the badge sat on "— s behind" forever.
   if (typeof liveVideo.getStartDate === "function") {
     const start = liveVideo.getStartDate();
     if (start instanceof Date && !isNaN(start) && liveVideo.currentTime > 0) {
       return { s: (Date.now() - (start.getTime() + liveVideo.currentTime * 1000)) / 1000, real: true };
     }
+  }
+  // Last resort: distance from the seekable edge. Edge-relative, not wall clock,
+  // so it under-reports by the pipeline delay — but it is a real number, and it
+  // still shows drift growing, which is the failure worth seeing.
+  const s = liveVideo.seekable;
+  if (s && s.length && liveVideo.currentTime > 0) {
+    return { s: s.end(s.length - 1) - liveVideo.currentTime, real: false };
   }
   return null;
 }
