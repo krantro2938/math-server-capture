@@ -124,6 +124,15 @@ type State = {
     updated_at: string;
     capture_count: number;
     done: boolean; // model thinks the assignment is fully captured
+    /**
+     * Whether ANY frame in this attempt has shown the whole sheet.
+     *
+     * The gate on `done`. Every other signal is about the problems we have; this
+     * is the only one that says anything about problems we might not — a model
+     * looking at the top two thirds of a page can call what it sees complete
+     * and be perfectly right and still be missing problem 25.
+     */
+    full_page_seen: boolean;
     assignment: Assignment;
     captures: CaptureLog[];
     job: Job;
@@ -153,6 +162,7 @@ const newState = (version: number): State => ({
     updated_at: new Date().toISOString(),
     capture_count: 0,
     done: false,
+    full_page_seen: false,
     assignment: emptyAssignment(),
     captures: [],
     job: idleJob(),
@@ -174,6 +184,7 @@ function loadState(): State {
                 readFileSync(STATE_FILE, "utf8"),
             ) as State;
             loaded.job = { ...idleJob(), ...(loaded.job ?? {}) }; // state.json from an older build
+            loaded.full_page_seen = Boolean(loaded.full_page_seen); // ditto
             return loaded;
         }
     } catch (e) {
@@ -567,8 +578,18 @@ const snapshot = () => ({
     capturing,
     job: state.job,
     problems: state.assignment.problems?.length ?? 0,
+    // How much of what we have is finished, and whether the sheet has ever been
+    // fully in frame. Together these are "how far along is this really", which
+    // a bare problem count cannot say.
+    problems_complete: completeCount(),
+    full_page_seen: state.full_page_seen,
     last_capture: state.captures.at(-1) ?? null,
 });
+
+/** Problems whose statement the model says it has in full. */
+function completeCount(): number {
+    return (state.assignment.problems ?? []).filter((p) => p.complete).length;
+}
 
 // Comment lines keep the connection (and any proxy in front of it) alive.
 setInterval(() => {
@@ -610,6 +631,81 @@ function eventStream(): Response {
 }
 
 // -------------------------------------------------------------- captures ----
+
+/**
+ * Fold a capture's transcription into the one we already have.
+ *
+ * The prompt asks for the COMPLETE updated transcription every pass, and mostly
+ * that is what comes back. "Mostly" is not a guarantee, and the assignment used
+ * to be REPLACED wholesale with whatever the last frame said — so one bad frame
+ * could delete the work of a dozen good ones. It doesn't take a misbehaving
+ * model: a frame with the bottom half of the sheet out of view genuinely cannot
+ * see problems it transcribed two captures ago, and saying so is the honest
+ * answer to the question we asked.
+ *
+ * So the union wins and a problem never goes backwards. A complete statement is
+ * never replaced by an incomplete one, a problem that has been seen once is
+ * never dropped because a later frame missed it, and a statement that suddenly
+ * loses most of its text — what truncation and half-reads look like — is kept
+ * as it was.
+ */
+function mergeAssignment(
+    prev: Assignment,
+    next: Assignment,
+): { merged: Assignment; kept: string[] } {
+    const byNumber = new Map<string, Problem>();
+    for (const p of prev.problems ?? []) byNumber.set(p.number, p);
+
+    /** Problems where we rejected the new reading in favour of what we had. */
+    const kept: string[] = [];
+
+    for (const p of next.problems ?? []) {
+        const old = byNumber.get(p.number);
+        if (!old) {
+            byNumber.set(p.number, p);
+            continue;
+        }
+        // Finished → partial is always a loss.
+        if (old.complete && !p.complete) {
+            kept.push(p.number);
+            continue;
+        }
+        // Both finished: take the newer reading, which is usually a refinement —
+        // unless most of the text vanished, which is not a refinement.
+        if (
+            old.complete &&
+            p.complete &&
+            p.statement_latex.length < old.statement_latex.length * 0.6
+        ) {
+            kept.push(p.number);
+            continue;
+        }
+        byNumber.set(p.number, p);
+    }
+
+    // Order: whatever the model last said, then anything it forgot, in the order
+    // we already knew them — so a problem the camera has drifted off doesn't
+    // jump to the end of the sheet.
+    const order: string[] = [];
+    for (const p of next.problems ?? []) order.push(p.number);
+    for (const p of prev.problems ?? []) {
+        if (!order.includes(p.number)) order.push(p.number);
+    }
+
+    return {
+        merged: {
+            // An empty field on this frame doesn't unname the assignment.
+            title: next.title || prev.title,
+            subject: next.subject || prev.subject,
+            instructions_latex:
+                next.instructions_latex || prev.instructions_latex,
+            problems: order
+                .map((n) => byNumber.get(n))
+                .filter((p): p is Problem => Boolean(p)),
+        },
+        kept,
+    };
+}
 
 // One capture at a time: two overlapping calls would each merge against the same
 // "before" state and the second would clobber the first.
@@ -668,8 +764,54 @@ async function doCapture(note: string) {
         }
 
         state.capture_count += 1;
-        state.assignment = result.assignment;
-        state.done = result.done;
+
+        // A frame with no paper in it has nothing to contribute, and merging its
+        // empty transcription is the one way left to lose everything at once.
+        // It still counts as a capture: it cost an API call either way.
+        const usable = result.frame_quality !== "no_paper";
+        let kept: string[] = [];
+        if (usable) {
+            const merge = mergeAssignment(state.assignment, result.assignment);
+            state.assignment = merge.merged;
+            kept = merge.kept;
+        }
+
+        if (result.framing.full_page_visible) state.full_page_seen = true;
+
+        // `done` is a claim, and it is now checked rather than believed.
+        //
+        // The model can only speak for what it can see. Asked "is the whole
+        // assignment captured?" while looking at the top two thirds of a sheet,
+        // it can answer yes in perfectly good faith — every problem IN FRAME is
+        // complete — and the job stops with problem 25 never read. That is the
+        // failure this exists to prevent: it is silent, it looks like success,
+        // and the only sign is a solution that answers fewer problems than the
+        // paper has.
+        //
+        // So finishing needs all three: the model says so, every problem we hold
+        // is complete, and at some point this attempt has seen the whole sheet
+        // in one frame. If the camera never shows the whole page the job never
+        // self-completes, which is correct — it hasn't read the whole page —
+        // and max_captures still bounds the cost while the glasses say which way
+        // to move the camera.
+        const problems = state.assignment.problems ?? [];
+        const allComplete = problems.length > 0 && problems.every((p) => p.complete);
+        state.done =
+            Boolean(result.done) && usable && allComplete && state.full_page_seen;
+
+        if (result.done && !state.done) {
+            emit("done_rejected", {
+                reason: !usable
+                    ? "no paper in frame"
+                    : !allComplete
+                      ? "not every problem is complete"
+                      : "the whole sheet has never been in frame",
+                problems: problems.length,
+                problems_complete: completeCount(),
+                full_page_seen: state.full_page_seen,
+            });
+        }
+
         const log: CaptureLog = {
             n: state.capture_count,
             at: new Date().toISOString(),
@@ -692,12 +834,17 @@ async function doCapture(note: string) {
             needs_adjustment,
             done: state.done,
             problems: state.assignment.problems?.length ?? 0,
+            problems_complete: completeCount(),
+            full_page_seen: state.full_page_seen,
+            // Problems whose older reading we preferred to this frame's.
+            kept: kept.length ? kept : undefined,
             assignment: state.assignment,
         });
         if (state.done)
             emit("done", {
                 version: state.version,
                 problems: state.assignment.problems?.length ?? 0,
+                problems_complete: completeCount(),
             });
 
         return {
