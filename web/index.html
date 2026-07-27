@@ -145,10 +145,16 @@ function startLive() {
       // drifts forever with nothing to pull it back.
       //
       // So: pick both explicitly. 0.8s is comfortable headroom over 0.335s,
-      // giving a 1.8s catch-up window, and 4s is a hard ceiling that forces a
+      // giving a 1.2s catch-up window, and 2s is a hard ceiling that forces a
       // jump forward rather than an unbounded slide.
+      //
+      // The ceiling was 4s, which measured as the single biggest term in the
+      // observed delay: the player would sit at its (ratcheted) target, drift
+      // out toward 4s, and only claw back at 1.05x — so the *typical* latency
+      // was the middle of that slide, ~3.3s, not the target. Steady state on
+      // this stream is ~1.0s, so 2s is ample headroom and halves the worst case.
       liveSyncDuration: 0.8,
-      liveMaxLatencyDuration: 4,
+      liveMaxLatencyDuration: 2,
       // Per-stall penalty. hls.js defaults this to a FULL SECOND, capped at
       // targetduration — so with 1s segments, a single stall anywhere in the
       // session pushed targetLatency from 0.8 straight to 1.8 and pinned it
@@ -175,7 +181,15 @@ function startLive() {
     hls.attachMedia(liveVideo);
     // Jump to the live edge ONCE when it first starts — but never again, so you
     // can freely scrub back into the buffered window without being yanked forward.
-    hls.once(Hls.Events.FRAG_BUFFERED, goLive);
+    //
+    // Waiting for a real buffer first, rather than the very first FRAG_BUFFERED,
+    // is what keeps the session out of the stall ratchet below. On the first
+    // fragment there is often only a part or two buffered, liveSyncPosition sits
+    // past the end, and goLive()'s clamp parks the playhead 0.1s from the buffer
+    // end — which stalls almost immediately. Those startup stalls used to be
+    // most of the session's stall count, and hls.js never forgets a stall.
+    startLiveWhenBuffered();
+    startRatchetWatch();
   } else if (liveVideo.canPlayType("application/vnd.apple.mpegurl")) {
     liveVideo.src = src;                       // native HLS (older iOS, no MSE)
     liveVideo.addEventListener("loadedmetadata", goLive, { once: true });
@@ -187,8 +201,67 @@ function startLive() {
 function stopLive() {
   if (hls) { hls.destroy(); hls = null; }
   stopDriftWatch();
+  stopRatchetWatch();
   liveVideo.removeAttribute("src"); liveVideo.load();
 }
+
+// ---------- go live once there is something to play ----------
+// Hold off the initial seek until the buffer can actually sustain the target
+// latency, so we do not start life 0.1s from the end of a nearly empty buffer.
+// Bounded by a deadline: on a stream that never fills we still go live rather
+// than sitting at frame zero forever.
+const GOLIVE_MIN_BUFFER = 1.2;   // seconds; > liveSyncDuration (0.8)
+const GOLIVE_DEADLINE_MS = 4000;
+function startLiveWhenBuffered() {
+  const started = Date.now();
+  const onFrag = () => {
+    const v = liveVideo;
+    const buffered = v.buffered.length ? v.buffered.end(v.buffered.length - 1) - v.buffered.start(0) : 0;
+    if (buffered >= GOLIVE_MIN_BUFFER || Date.now() - started > GOLIVE_DEADLINE_MS) {
+      hls.off(Hls.Events.FRAG_BUFFERED, onFrag);
+      goLive();
+    }
+  };
+  hls.on(Hls.Events.FRAG_BUFFERED, onFrag);
+}
+
+// ---------- stall-ratchet watchdog ----------
+// hls.js penalises itself for every stall and never lets go:
+//
+//   targetLatency = liveSyncDuration + min(stallCount * liveSyncOnStallIncrease,
+//                                          targetduration)
+//
+// and stallCount is only ever reset in onManifestLoading — i.e. on a page
+// reload. So a handful of stalls (which this camera reliably produces while the
+// stream is starting up) pins the target at 0.8 + 1.0 = 1.8s for the rest of the
+// session, and the player then drifts above even that. Measured on the live
+// stream: five stalls in the first 45s, target saturated at 1.8s, latency
+// sitting at 1.8-2.9s and never recovering.
+//
+// Assigning hls.targetLatency runs a setter that zeroes stallCount, so once the
+// stream has been quiet for a while we hand the penalty back. Same measurement
+// after the reset: 1.0s, held for two minutes with no new stalls.
+let ratchetTimer = null, lastStallAt = 0;
+const RATCHET_BASE = 0.8;          // must match liveSyncDuration above
+const RATCHET_QUIET_MS = 30000;    // no stall for this long => drop the penalty
+
+function startRatchetWatch() {
+  stopRatchetWatch();
+  lastStallAt = Date.now();        // treat startup as a fresh stall period
+  hls.on(Hls.Events.ERROR, (_e, data) => {
+    if (data && data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) lastStallAt = Date.now();
+  });
+  ratchetTimer = setInterval(() => {
+    if (!hls) return;
+    if (Date.now() - lastStallAt < RATCHET_QUIET_MS) return;
+    // targetLatency reads back the penalised value, so anything above the base
+    // means stallCount > 0 and there is something to give back.
+    if (typeof hls.targetLatency === "number" && hls.targetLatency > RATCHET_BASE + 0.01) {
+      hls.targetLatency = RATCHET_BASE;
+    }
+  }, 5000);
+}
+function stopRatchetWatch() { if (ratchetTimer) { clearInterval(ratchetTimer); ratchetTimer = null; } }
 
 // ---------- native-HLS drift watchdog ----------
 // Only for the native fallback. hls.js corrects drift by itself (that is what
