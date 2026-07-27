@@ -32,6 +32,7 @@ POST /start ─┐
 | `GET` | `/assignment.md` | Same, rendered as Markdown + LaTeX |
 | `GET` | `/state` | Everything, including per-capture history |
 | `GET` | `/frame.jpg` | The last frame grabbed (see what the model saw) |
+| `GET` | `/snapshot.jpg` | The camera **now** — for aiming. Costs a frame grab, never an API call. Served from a ~1s cache; `?max_age_ms=0` forces a fresh grab |
 | `POST` | `/reset` | Archive the current attempt, start a clean version |
 | `GET` | `/health` | Unauthenticated liveness check |
 
@@ -197,6 +198,7 @@ Needs `ffmpeg` on PATH (the Docker image installs it).
 | `INTERVAL_MS` | `1000` | pause between captures in a job |
 | `MAX_CAPTURES` | `40` | spend ceiling per job |
 | `MAX_FAILURES` | `5` | consecutive failures before the job gives up |
+| `SNAPSHOT_TTL_MS` | `1000` | how long `/snapshot.jpg` may reuse a frame. Captures ignore it and always grab fresh |
 | `AUTO_RESUME` | `1` | resume an interrupted job on restart |
 
 ## How it works

@@ -19,6 +19,7 @@
  *   GET  /assignment.md    the same thing rendered as Markdown + LaTeX
  *   GET  /state            everything, incl. per-capture history
  *   GET  /frame.jpg        the last frame grabbed (to see what the model saw)
+ *   GET  /snapshot.jpg     the camera RIGHT NOW (to see where it is pointing)
  *   POST /reset            archive the current attempt and start clean
  *   GET  /archive          every attempt, newest first (the live one included)
  *   GET  /archive/:v       one attempt, same shape as /assignment
@@ -221,6 +222,37 @@ function saveState() {
  *  one, else straight off RTSP. Fails loudly if the stream isn't publishing. */
 async function grabFrame(): Promise<Buffer> {
     return cfg.snapshotUrl ? grabViaGateway() : grabViaRtsp();
+}
+
+/**
+ * How long /snapshot.jpg may serve the frame it already has.
+ *
+ * Captures never come through here — they call grabFrame() directly and pass
+ * max_age_ms=0 to the gateway, because a capture must see the paper as it is
+ * now. This cache is for the aiming preview, which polls: without it, every
+ * poll (and every extra viewer) spawns an ffmpeg on the RTSP fallback path and
+ * a decode on the gateway. One second is below the round trip to the glasses,
+ * so nobody sees a frame they'd call stale.
+ */
+const SNAPSHOT_TTL_MS = Number(process.env.SNAPSHOT_TTL_MS ?? 1000);
+
+let liveCache: { at: number; jpeg: Buffer } | null = null;
+let liveInFlight: Promise<Buffer> | null = null;
+
+/** A recent frame, coalescing concurrent askers onto one grab. */
+async function liveFrame(maxAgeMs: number): Promise<Buffer> {
+    if (liveCache && Date.now() - liveCache.at <= maxAgeMs) return liveCache.jpeg;
+    if (!liveInFlight) {
+        liveInFlight = grabFrame()
+            .then((jpeg) => {
+                liveCache = { at: Date.now(), jpeg };
+                return jpeg;
+            })
+            .finally(() => {
+                liveInFlight = null;
+            });
+    }
+    return liveInFlight;
 }
 
 async function grabViaGateway(): Promise<Buffer> {
@@ -1312,6 +1344,29 @@ const server = Bun.serve({
             });
         }
 
+        // The camera as it is NOW, which is a different question from /frame.jpg
+        // — that one is the last frame a capture happened to take, so it is
+        // stale between captures and absent entirely before the first one. This
+        // is what you watch while aiming: it costs no API call, only a frame
+        // grab, and it answers the one thing the model's advice enum cannot say
+        // (which way up the camera is).
+        if (path === "/snapshot.jpg" && req.method === "GET") {
+            const maxAge = Number(url.searchParams.get("max_age_ms") ?? SNAPSHOT_TTL_MS);
+            try {
+                const jpeg = await liveFrame(Number.isFinite(maxAge) ? maxAge : SNAPSHOT_TTL_MS);
+                return new Response(jpeg, {
+                    headers: {
+                        "content-type": "image/jpeg",
+                        // A preview that polls must never be handed a proxy's
+                        // copy of where the camera used to point.
+                        "cache-control": "no-store",
+                    },
+                });
+            } catch (e: any) {
+                return json({ error: String(e?.message ?? e) }, 502);
+            }
+        }
+
         // Start over. The old attempt is archived rather than deleted — flushing
         // progress shouldn't be able to destroy a transcription you wanted.
         if (path === "/reset" && req.method === "POST") {
@@ -1355,6 +1410,7 @@ const server = Bun.serve({
                     "GET /assignment.md",
                     "GET /state",
                     "GET /frame.jpg",
+                    "GET /snapshot.jpg",
                     "POST /reset",
                     "GET /archive",
                     "GET /archive/:version",
