@@ -375,11 +375,20 @@ YOUR TWO JOBS
    camera must move up (camera_advice="move_up"). If text is too small or
    unreadable, "move_closer". If nothing readable is in frame, "no_paper".
 
-MATH MUST BE LaTeX
+MATH MUST BE LaTeX, PROSE MUST NOT BE
 Every mathematical symbol, fraction, exponent, root, integral, matrix or
 equation goes in LaTeX: inline as $...$ and display as $$...$$. Never
 approximate math with plain text (write $\\frac{3}{4}$, not 3/4; $x^2$, not x2).
-Plain prose stays plain.
+
+A statement is ORDINARY SENTENCES with $...$ islands in them. It is NOT one
+long LaTeX expression. Never wrap words in \\text{} — if you find yourself
+writing \\text{}, the words belong outside the math, not inside it. Every
+statement_latex must contain at least one $ if it contains any mathematics.
+
+  RIGHT: Отрезки $AB$ и $CD$ являются хордами. Найдите $AB$, если $CD = 18$.
+  WRONG: \\text{Отрезки } AB \\text{ и } CD \\text{ являются хордами.}
+
+The wrong form cannot be rendered or read by anything downstream.
 
 THIS IS ONE CONTINUING TRANSCRIPTION
 You have seen earlier frames of the SAME assignment. Here is the transcription
@@ -907,16 +916,88 @@ function archiveList(): ArchiveEntry[] {
     return [describeAttempt(state, false), ...filed];
 }
 
+/**
+ * Rescue a statement the model wrote as ONE LaTeX expression.
+ *
+ * The prompt asks for prose with `$…$` islands, and most of the time that is
+ * what comes back. Sometimes it doesn't: the whole sentence arrives as bare
+ * LaTeX with the words in `\text{…}` and no `$` anywhere —
+ *
+ *   \text{Решите уравнение } 2x^2 - 3x + \sqrt{4 - x} = 27.
+ *
+ * Nothing downstream can render that. A markdown renderer has no delimiter to
+ * trigger on, so it prints the backslashes verbatim, and the solver on the
+ * glasses is handed the same soup. Wrapping the lot in `$…$` instead would
+ * render but never wrap — one unbreakable line off the side of a 576px display.
+ *
+ * So: turn it back into what was asked for. `\text{…}` runs become prose, and
+ * the mathematics between them becomes `$…$`. Strings that already contain `$`
+ * are left exactly as they are.
+ */
+function normalizeLatex(raw: string): string {
+    const s = (raw ?? "").trim();
+    // Already delimited, empty, or plain prose with nothing to fix.
+    if (!s || s.includes("$") || !s.includes("\\")) return s;
+
+    const out: string[] = [];
+    /** Append, keeping a space at every prose/math boundary. */
+    const push = (text: string) => {
+        if (!text) return;
+        const last = out[out.length - 1];
+        if (last && !/\s$/.test(last) && !/^\s/.test(text)) out.push(" ");
+        out.push(text);
+    };
+
+    const TEXT = "\\text{";
+    let i = 0;
+    let mathFrom = 0;
+
+    const flushMath = (end: number) => {
+        let chunk = s.slice(mathFrom, end).trim();
+        if (!chunk) return;
+        // Sentence punctuation belongs to the sentence. Left inside the math it
+        // picks up math spacing and reads as part of the formula.
+        const tail = /[.,;:]+$/.exec(chunk);
+        if (tail) chunk = chunk.slice(0, -tail[0].length).trim();
+        if (chunk) push(`$${chunk}$`);
+        if (tail) out.push(tail[0]);
+    };
+
+    while (i < s.length) {
+        if (!s.startsWith(TEXT, i)) {
+            i++;
+            continue;
+        }
+        flushMath(i);
+        // Brace matching rather than a regex: \text{} legitimately contains
+        // nested groups, and a lazy match would end at the first inner brace.
+        let depth = 1;
+        let j = i + TEXT.length;
+        for (; j < s.length && depth > 0; j++) {
+            if (s[j] === "{") depth++;
+            else if (s[j] === "}") depth--;
+        }
+        push(s.slice(i + TEXT.length, j - 1));
+        i = j;
+        mathFrom = i;
+    }
+    flushMath(s.length);
+
+    const joined = out.join("").replace(/[ \t]+/g, " ").trim();
+    // Nothing recognisable was found — better the original than a mangling.
+    return joined || s;
+}
+
 function toMarkdown(a: Assignment): string {
     const lines: string[] = [];
     if (a.title) lines.push(`# ${a.title}`, "");
     if (a.subject) lines.push(`*${a.subject}*`, "");
-    if (a.instructions_latex) lines.push(a.instructions_latex, "");
+    if (a.instructions_latex) lines.push(normalizeLatex(a.instructions_latex), "");
     for (const p of a.problems ?? []) {
         lines.push(
             `## ${p.number}${p.complete ? "" : "  _(incomplete)_"}`,
             "",
-            p.statement_latex,
+            normalizeLatex(p.statement_latex),
             "",
         );
     }
