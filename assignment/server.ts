@@ -20,6 +20,9 @@
  *   GET  /state            everything, incl. per-capture history
  *   GET  /frame.jpg        the last frame grabbed (to see what the model saw)
  *   POST /reset            archive the current attempt and start clean
+ *   GET  /archive          every attempt, newest first (the live one included)
+ *   GET  /archive/:v       one attempt, same shape as /assignment
+ *   GET  /archive/:v.md    one attempt as Markdown, like /assignment.md
  *   GET  /health
  *
  * Bun, zero dependencies:  bun run server.ts
@@ -28,6 +31,7 @@ import {
     mkdirSync,
     existsSync,
     readFileSync,
+    readdirSync,
     writeFileSync,
     renameSync,
 } from "node:fs";
@@ -830,6 +834,79 @@ function authed(req: Request): boolean {
     );
 }
 
+// ---------------------------------------------------------------- archive ---
+//
+// /reset files the outgoing attempt away rather than deleting it, and until now
+// nothing could read those files back — the archive was write-only, which makes
+// it a backup nobody can restore from. These three routes are the read side.
+//
+// The listing includes the LIVE attempt alongside the filed ones, because a
+// caller offering "which scan do you want to look at?" wants one list, and the
+// difference between "on disk" and "in memory" is this module's problem rather
+// than theirs. `archived` says which is which.
+
+type ArchiveEntry = {
+    version: number;
+    created_at: string;
+    updated_at: string;
+    capture_count: number;
+    done: boolean;
+    problems: number;
+    title: string;
+    /** False for the attempt still in progress — it isn't a file yet. */
+    archived: boolean;
+};
+
+/** Archive filenames are `v{version}-{created_at}.json`; the version leads. */
+function archiveFiles(): { version: number; file: string }[] {
+    try {
+        return readdirSync(ARCHIVE_DIR)
+            .filter((f) => f.endsWith(".json"))
+            .map((f) => ({
+                version: Number(/^v(\d+)-/.exec(f)?.[1] ?? NaN),
+                file: join(ARCHIVE_DIR, f),
+            }))
+            .filter((e) => Number.isFinite(e.version))
+            .sort((a, b) => b.version - a.version);
+    } catch {
+        return []; // nothing has ever been reset, so there is no archive dir
+    }
+}
+
+function readArchived(version: number): State | null {
+    const hit = archiveFiles().find((e) => e.version === version);
+    if (!hit) return null;
+    try {
+        return JSON.parse(readFileSync(hit.file, "utf8")) as State;
+    } catch (e) {
+        // One corrupt file must not take the listing down with it.
+        console.error(`[!] archive v${version} unreadable:`, e);
+        return null;
+    }
+}
+
+const describeAttempt = (s: State, archived: boolean): ArchiveEntry => ({
+    version: s.version,
+    created_at: s.created_at,
+    updated_at: s.updated_at,
+    capture_count: s.capture_count,
+    done: s.done,
+    problems: s.assignment.problems.length,
+    title: s.assignment.title,
+    archived,
+});
+
+/** Newest first, live attempt at the head. */
+function archiveList(): ArchiveEntry[] {
+    const filed = archiveFiles()
+        .map((e) => readArchived(e.version))
+        .filter((s): s is State => s !== null)
+        // A version equal to the live one would be a duplicate of the head.
+        .filter((s) => s.version !== state.version)
+        .map((s) => describeAttempt(s, true));
+    return [describeAttempt(state, false), ...filed];
+}
+
 function toMarkdown(a: Assignment): string {
     const lines: string[] = [];
     if (a.title) lines.push(`# ${a.title}`, "");
@@ -970,6 +1047,35 @@ const server = Bun.serve({
 
         if (path === "/state" && req.method === "GET") return json(state);
 
+        if (path === "/archive" && req.method === "GET") {
+            return json({ current: state.version, versions: archiveList() });
+        }
+
+        // /archive/2 and /archive/2.md — one attempt, as JSON or as the same
+        // markdown /assignment.md renders for the live one. The live version is
+        // served from memory rather than 404'd: callers page through one list
+        // and shouldn't have to special-case its first entry.
+        const archived = /^\/archive\/(\d+)(\.md)?$/.exec(path);
+        if (archived && req.method === "GET") {
+            const version = Number(archived[1]);
+            const found = version === state.version ? state : readArchived(version);
+            if (!found) return json({ error: `no version ${version}` }, 404);
+            if (archived[2]) {
+                return new Response(toMarkdown(found.assignment), {
+                    headers: { "content-type": "text/markdown; charset=utf-8" },
+                });
+            }
+            return json({
+                version: found.version,
+                created_at: found.created_at,
+                updated_at: found.updated_at,
+                capture_count: found.capture_count,
+                done: found.done,
+                archived: version !== state.version,
+                assignment: found.assignment,
+            });
+        }
+
         if (path === "/frame.jpg" && req.method === "GET") {
             if (!existsSync(FRAME_FILE))
                 return json({ error: "no frame captured yet" }, 404);
@@ -1022,6 +1128,9 @@ const server = Bun.serve({
                     "GET /state",
                     "GET /frame.jpg",
                     "POST /reset",
+                    "GET /archive",
+                    "GET /archive/:version",
+                    "GET /archive/:version.md",
                     "GET /health",
                 ],
             },
