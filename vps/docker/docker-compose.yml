@@ -103,6 +103,11 @@ services:
       # evens stack's compose file), so the browser never talks to it directly —
       # which matters, because that server has no password and this one does.
       EVENS_URL: ${EVENS_URL:-http://evens:8787}
+      # Sending a message to the glasses is gated on the document server, and
+      # this process is the only thing that holds the token — so "logged into
+      # this app" is the only way to put text on someone's face. Must equal
+      # MESSAGE_TOKEN in the evens stack's .env.
+      MESSAGE_TOKEN: ${MESSAGE_TOKEN:-}
 
   # ------------------------------------------------------------ assignment ---
   # Opt-in: `docker compose --profile assignment up -d`. Reads the assignment on

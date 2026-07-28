@@ -42,6 +42,13 @@ const CFG = {
   // protect. Going through here means the session cookie gates it.
   evensUrl: process.env.EVENS_URL ?? "http://evens:8787",
   snapshotTimeoutMs: Number(process.env.SNAPSHOT_TIMEOUT_MS ?? 20000),
+
+  // Sending a message to the glasses is the one thing on the document server
+  // that must NOT be open: it puts text on someone's face. That server gates
+  // POST /messages on this token, and this process is the only thing that holds
+  // it — so the send path is "logged into cam.aansl.com" and nothing else.
+  // Must match MESSAGE_TOKEN in the evens stack's .env.
+  messageToken: process.env.MESSAGE_TOKEN ?? "",
 };
 
 const mtxAuth = "Basic " + Buffer.from(`${CFG.mtxUser}:${CFG.mtxPass}`).toString("base64");
@@ -263,6 +270,55 @@ Bun.serve({
       } catch (e: any) {
         // Named so the page can say which service is down. "Failed to fetch"
         // in a browser console is the same message for every possible cause.
+        return Response.json(
+          { ok: false, reason: `document server unreachable: ${e?.message ?? e}` },
+          { status: 502 },
+        );
+      }
+    }
+
+    // --- messages to and from the glasses ---------------------------------
+    //
+    // Same forwarding shape as /api/doc, and for the same reason: the document
+    // server has no login of its own. The difference is the token — the send
+    // route over there refuses anything that doesn't carry it, so this proxy is
+    // structurally the only way to put a message on the glasses.
+    if (path === "/api/messages" || path.startsWith("/api/messages/")) {
+      const upstreamPath = path.slice("/api".length);
+
+      // The event stream is proxied rather than polled so a quick reply tapped
+      // on the glasses lands in the open widget immediately. Body is piped, not
+      // buffered: buffering an SSE stream would hold it until it ended, which
+      // for a stream that never ends means forever.
+      if (upstreamPath === "/messages/events") {
+        const upstream = await fetch(`${CFG.evensUrl}/messages/events`, {
+          headers: { accept: "text/event-stream" },
+        });
+        return new Response(upstream.body, {
+          status: upstream.status,
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            connection: "keep-alive",
+          },
+        });
+      }
+
+      try {
+        const upstream = await fetch(`${CFG.evensUrl}${upstreamPath}${url.search}`, {
+          method: req.method,
+          headers: {
+            ...(req.method === "POST" ? { "content-type": "application/json" } : {}),
+            ...(CFG.messageToken ? { "x-message-token": CFG.messageToken } : {}),
+          },
+          body: req.method === "POST" ? await req.text() : undefined,
+          signal: AbortSignal.timeout(15000),
+        });
+        return new Response(await upstream.text(), {
+          status: upstream.status,
+          headers: json,
+        });
+      } catch (e: any) {
         return Response.json(
           { ok: false, reason: `document server unreachable: ${e?.message ?? e}` },
           { status: 502 },
