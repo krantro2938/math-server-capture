@@ -99,6 +99,10 @@ services:
       SESSION_HOURS: ${SESSION_HOURS:-720}
       MTX_RTSP_PORT: 8554
       SNAPSHOT_TOKEN: ${SNAPSHOT_TOKEN:-}    # lets the assignment reader pull stills
+      # The document server, for the Adri tabs. It joins THIS network (see the
+      # evens stack's compose file), so the browser never talks to it directly —
+      # which matters, because that server has no password and this one does.
+      EVENS_URL: ${EVENS_URL:-http://evens:8787}
 
   # ------------------------------------------------------------ assignment ---
   # Opt-in: `docker compose --profile assignment up -d`. Reads the assignment on

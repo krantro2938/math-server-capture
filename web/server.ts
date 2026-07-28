@@ -31,6 +31,16 @@ const CFG = {
   // Snapshots are served from a short cache so ten callers don't spawn ten
   // ffmpegs. Callers that need a guaranteed-fresh frame pass ?max_age_ms=0.
   snapshotTtlMs: Number(process.env.SNAPSHOT_TTL_MS ?? 1000),
+
+  // The document server (the evens stack), which owns the hand-written Adri
+  // documents. It sits on this compose network, so the default is the container
+  // — no TLS hop, and the browser never talks to it directly.
+  //
+  // PROXIED RATHER THAN CALLED FROM THE PAGE on purpose: this app is behind a
+  // password and that one is not, so a browser calling it straight would put an
+  // editing surface on the public internet that this login does nothing to
+  // protect. Going through here means the session cookie gates it.
+  evensUrl: process.env.EVENS_URL ?? "http://evens:8787",
   snapshotTimeoutMs: Number(process.env.SNAPSHOT_TIMEOUT_MS ?? 20000),
 };
 
@@ -229,6 +239,35 @@ Bun.serve({
     if (path === "/api/recordings") {
       const date = url.searchParams.get("date") ?? new Date().toISOString().slice(0, 10);
       return playbackList(date);
+    }
+
+    // --- the Adri documents, proxied to the document server ---------------
+    //
+    // One row each, edited here and read back on the glasses. This is a dumb
+    // forwarder: the slug whitelist, the size limit and the versioning all live
+    // over there, and duplicating any of them here would be two places to
+    // change and one to forget.
+    const doc = /^\/api\/doc\/([a-z0-9-]+)$/.exec(path);
+    if (doc && (req.method === "GET" || req.method === "PUT")) {
+      try {
+        const upstream = await fetch(`${CFG.evensUrl}/doc/${doc[1]}`, {
+          method: req.method,
+          headers: req.method === "PUT" ? { "content-type": "application/json" } : {},
+          body: req.method === "PUT" ? await req.text() : undefined,
+          signal: AbortSignal.timeout(15000),
+        });
+        return new Response(await upstream.text(), {
+          status: upstream.status,
+          headers: { "content-type": "application/json" },
+        });
+      } catch (e: any) {
+        // Named so the page can say which service is down. "Failed to fetch"
+        // in a browser console is the same message for every possible cause.
+        return Response.json(
+          { ok: false, reason: `document server unreachable: ${e?.message ?? e}` },
+          { status: 502 },
+        );
+      }
     }
 
     if (path === "/api/clip") {

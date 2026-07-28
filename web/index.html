@@ -52,6 +52,17 @@
   .seg:hover { background: #14171c; }
   .seg.playing { background: #1e293b; color: #93c5fd; }
   .seg .dur { color: #8b909a; font-variant-numeric: tabular-nums; }
+
+  /* The Adri editors. Capped rather than full-bleed: a 2000px-wide textarea is
+     one line of maths per screen and nothing to anchor the eye. */
+  .docwrap { max-width: 860px; }
+  .docwrap h2 { margin: 0 0 4px; font-size: 17px; }
+  .docmeta { color: #8b909a; font-size: 13px; margin: 6px 0 10px; }
+  textarea.doc {
+    width: 100%; box-sizing: border-box; padding: 12px; resize: vertical;
+    background: #14171c; color: #e6e8eb; border: 1px solid #23262d; border-radius: 8px;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
   .hidden { display: none; }
 </style>
 </head>
@@ -61,6 +72,8 @@
   <div class="tabs">
     <button class="tab active" data-tab="live" id="tab-live">● Live</button>
     <button class="tab" data-tab="rec" id="tab-rec">Recordings</button>
+    <button class="tab" data-tab="adri-assignment" id="tab-adri-assignment">Adri task</button>
+    <button class="tab" data-tab="adri-solution" id="tab-adri-solution">Adri answer</button>
   </div>
   <span class="grow"></span>
   <a class="logout" href="/logout">Sign out</a>
@@ -86,6 +99,38 @@
       <span class="hint" id="recinfo"></span>
     </div>
     <div class="segs" id="segs"></div>
+  </section>
+
+  <!-- ADRI: two hand-written documents, one of each. Saving replaces what was
+       there and changes the version, which is what makes the glasses redraw. -->
+  <section id="view-adri-assignment" class="hidden">
+    <div class="docwrap">
+      <h2>Adri — the assignment</h2>
+      <p class="hint">State it yourself. Nothing reads this off the camera.</p>
+      <p class="docmeta" id="meta-adri-assignment"></p>
+      <textarea class="doc" id="doc-adri-assignment" rows="18"
+        placeholder="# Adri&#10;&#10;1. …&#10;&#10;Markdown and $LaTeX$ both render on the glasses."></textarea>
+      <div class="row">
+        <button class="btn" id="save-adri-assignment" disabled>Saved</button>
+        <button class="btn" id="reload-adri-assignment">Reload</button>
+        <span class="hint" id="status-adri-assignment"></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-adri-solution" class="hidden">
+    <div class="docwrap">
+      <h2>Adri — the solution</h2>
+      <p class="hint">There is one of these. Saving replaces it and the glasses&rsquo; Adri page redraws.</p>
+      <p class="docmeta" id="meta-adri-solution"></p>
+      <textarea class="doc" id="doc-adri-solution" rows="18"
+        placeholder="# Adri&#10;&#10;1. …"></textarea>
+      <div class="row">
+        <button class="btn" id="save-adri-solution" disabled>Saved</button>
+        <button class="btn" id="reload-adri-solution">Reload</button>
+        <span class="hint" id="status-adri-solution"></span>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -389,14 +434,86 @@ function updateLiveLag() {
 // a second behind the thing it is measuring.
 setInterval(updateLiveLag, 500);
 
+const VIEWS = ["live", "rec", "adri-assignment", "adri-solution"];
+
 document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
   t.classList.add("active");
-  const live = t.dataset.tab === "live";
-  $("#view-live").classList.toggle("hidden", !live);
-  $("#view-rec").classList.toggle("hidden", live);
-  if (live) { startLive(); } else { stopLive(); if (!$("#segs").dataset.loaded) loadDay(); }
+  const which = t.dataset.tab;
+  VIEWS.forEach((v) => $("#view-" + v).classList.toggle("hidden", v !== which));
+
+  // The live stream is the one thing here that costs bandwidth while you are
+  // not looking at it, so it is started and stopped rather than left running.
+  if (which === "live") startLive();
+  else stopLive();
+
+  if (which === "rec" && !$("#segs").dataset.loaded) loadDay();
+  if (which.startsWith("adri-")) loadDoc(which);
 }));
+
+// ---------- the Adri documents ----------
+//
+// One of each, replaced on save. The version is a content hash on the server,
+// so saving unchanged text is a no-op all the way down — which is why the
+// button reads "Saved" and is disabled until you actually change something.
+
+const docState = {};   // slug -> what the server last told us it holds
+
+async function loadDoc(slug) {
+  const box = $("#doc-" + slug);
+  const meta = $("#meta-" + slug);
+  try {
+    const res = await fetch("/api/doc/" + slug);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const doc = await res.json();
+    docState[slug] = doc.markdown || "";
+    // Never over a cursor: being one save behind beats losing what you typed.
+    if (document.activeElement !== box) box.value = docState[slug];
+    meta.textContent = doc.saved
+      ? `Saved ${new Date(doc.updated_at).toLocaleString()} · ${doc.markdown.length} characters · version ${doc.version}`
+      : "Not written yet.";
+    markDocDirty(slug);
+    $("#status-" + slug).textContent = "";
+  } catch (e) {
+    $("#status-" + slug).textContent = "Could not load: " + e.message;
+  }
+}
+
+function markDocDirty(slug) {
+  const dirty = $("#doc-" + slug).value.trim() !== (docState[slug] ?? "");
+  const btn = $("#save-" + slug);
+  btn.textContent = dirty ? "Save changes" : "Saved";
+  btn.disabled = !dirty;
+}
+
+async function saveDoc(slug) {
+  const btn = $("#save-" + slug);
+  btn.disabled = true;
+  $("#status-" + slug).textContent = "Saving...";
+  try {
+    const res = await fetch("/api/doc/" + slug, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ markdown: $("#doc-" + slug).value }),
+    });
+    const body = await res.json();
+    if (!body.ok) throw new Error(body.reason || ("HTTP " + res.status));
+    // Reload FIRST, then say so: loadDoc clears the status line (that is how a
+    // stale error goes away), so setting the message before it would wipe the
+    // one thing telling you the save worked.
+    await loadDoc(slug);
+    $("#status-" + slug).textContent = `Saved — version ${body.version}. The glasses have it.`;
+  } catch (e) {
+    $("#status-" + slug).textContent = "Could not save: " + e.message;
+    btn.disabled = false;
+  }
+}
+
+["adri-assignment", "adri-solution"].forEach((slug) => {
+  $("#doc-" + slug).addEventListener("input", () => markDocDirty(slug));
+  $("#save-" + slug).addEventListener("click", () => saveDoc(slug));
+  $("#reload-" + slug).addEventListener("click", () => loadDoc(slug));
+});
 
 // ---------- recordings ----------
 const dateEl = $("#date");
