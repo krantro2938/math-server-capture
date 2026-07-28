@@ -106,7 +106,7 @@
   <section id="view-adri-assignment" class="hidden">
     <div class="docwrap">
       <h2>Adri — the assignment</h2>
-      <p class="hint">State it yourself. Nothing reads this off the camera.</p>
+      <p class="hint">State it yourself, and saving publishes it <b>as the assignment</b> &mdash; a new version, with the previous one archived. No camera and no model call.</p>
       <p class="docmeta" id="meta-adri-assignment"></p>
       <textarea class="doc" id="doc-adri-assignment" rows="18"
         placeholder="# Adri&#10;&#10;1. …&#10;&#10;Markdown and $LaTeX$ both render on the glasses."></textarea>
@@ -502,7 +502,14 @@ async function saveDoc(slug) {
     // stale error goes away), so setting the message before it would wipe the
     // one thing telling you the save worked.
     await loadDoc(slug);
-    $("#status-" + slug).textContent = `Saved — version ${body.version}. The glasses have it.`;
+    // The task also goes upstream as a new assignment version; say which one,
+    // because that is the number the glasses and the archive will show.
+    const a = body.assignment;
+    $("#status-" + slug).textContent = a
+      ? (a.ok
+          ? `Saved, and published as assignment v${a.version} — ${a.problems} problem${a.problems === 1 ? "" : "s"}.`
+          : `Saved, but it did NOT reach the assignment: ${a.detail}`)
+      : `Saved — version ${body.version}. The glasses have it.`;
   } catch (e) {
     $("#status-" + slug).textContent = "Could not save: " + e.message;
     btn.disabled = false;

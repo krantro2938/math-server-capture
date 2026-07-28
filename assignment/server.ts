@@ -16,6 +16,7 @@
  *   GET  /events           SSE — live progress as the job works
  *   POST /capture          one single capture (manual/debug)
  *   POST /photo            read a PHOTO as the assignment (image in the body)
+ *   POST /assignment       set the assignment from TYPED markdown (no model call)
  *   GET  /assignment       the assignment as JSON (what you're after)
  *   GET  /assignment.md    the same thing rendered as Markdown + LaTeX
  *   GET  /state            everything, incl. per-capture history
@@ -765,6 +766,9 @@ const GEMINI_IMAGE_TYPES = [
  */
 const MAX_PHOTO_BYTES = Number(process.env.MAX_PHOTO_BYTES ?? 12_000_000);
 
+/** Ceiling on a typed assignment. Costs no API call, but it does get rendered. */
+const MAX_TEXT_CHARS = Number(process.env.MAX_TEXT_CHARS ?? 200_000);
+
 /**
  * Archive the current attempt and start a clean one.
  *
@@ -774,12 +778,19 @@ const MAX_PHOTO_BYTES = Number(process.env.MAX_PHOTO_BYTES ?? 12_000_000);
  */
 function resetAssignment(): { version: number; archived: boolean } {
     const previous = state;
+    // Worth keeping if it holds anything, which is NOT the same as "it had
+    // captures". A typed assignment (POST /assignment) has real content and
+    // zero captures, and gating on the capture count alone silently dropped it
+    // the moment you edited the text — the version picker on the glasses would
+    // show only the newest, and the older ones were gone for good.
+    const worthKeeping =
+        previous.capture_count > 0 || (previous.assignment.problems?.length ?? 0) > 0;
     if (previous.job.running) {
         // a reset implies "stop what you're doing"
         previous.job.running = false;
         wakeFromSleep?.();
     }
-    if (previous.capture_count > 0) {
+    if (worthKeeping) {
         writeAtomic(
             join(
                 ARCHIVE_DIR,
@@ -790,11 +801,8 @@ function resetAssignment(): { version: number; archived: boolean } {
     }
     state = newState(previous.version + 1);
     saveState();
-    emit("reset", {
-        version: state.version,
-        archived: previous.capture_count > 0,
-    });
-    return { version: state.version, archived: previous.capture_count > 0 };
+    emit("reset", { version: state.version, archived: worthKeeping });
+    return { version: state.version, archived: worthKeeping };
 }
 
 // One capture at a time: two overlapping calls would each merge against the same
@@ -1235,6 +1243,76 @@ function normalizeLatex(raw: string): string {
     return joined || s;
 }
 
+/**
+ * Markdown back into an Assignment — the inverse of toMarkdown below.
+ *
+ * For an assignment you TYPED rather than photographed (POST /assignment). It
+ * has to produce the same structure a capture does, because everything
+ * downstream counts problems out of it: the glasses' footer, the solve button's
+ * "3 problems read", and the `done` gate.
+ *
+ * Deliberately forgiving. It round-trips this server's own output exactly, and
+ * for anything else it degrades rather than failing: text with no `##` headings
+ * becomes a single instructions block, which renders correctly and simply
+ * reports one problem instead of pretending to know better.
+ */
+function fromMarkdown(markdown: string): Assignment {
+    const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+    const out = emptyAssignment();
+
+    let cursor = 0;
+    if (lines[cursor]?.startsWith("# ")) {
+        out.title = lines[cursor]!.slice(2).trim();
+        cursor++;
+    }
+    while (lines[cursor]?.trim() === "") cursor++;
+    const subject = /^\*([^*]+)\*$/.exec(lines[cursor]?.trim() ?? "");
+    if (subject) {
+        out.subject = subject[1]!.trim();
+        cursor++;
+    }
+
+    const preamble: string[] = [];
+    for (; cursor < lines.length; cursor++) {
+        if (lines[cursor]!.startsWith("## ")) break;
+        preamble.push(lines[cursor]!);
+    }
+    out.instructions_latex = preamble.join("\n").trim();
+
+    let current: Problem | null = null;
+    const body: string[] = [];
+    const flush = () => {
+        if (!current) return;
+        current.statement_latex = body.join("\n").trim();
+        out.problems.push(current);
+        body.length = 0;
+    };
+    for (; cursor < lines.length; cursor++) {
+        const heading = /^##\s+(.*)$/.exec(lines[cursor]!);
+        if (heading) {
+            flush();
+            // `_(incomplete)_` is what toMarkdown appends; anything you type by
+            // hand is complete by construction — you wrote the whole thing.
+            const label = heading[1]!.replace(/\s*_\(incomplete\)_\s*$/, "").trim();
+            current = { number: label, statement_latex: "", complete: true };
+        } else if (current) {
+            body.push(lines[cursor]!);
+        }
+    }
+    flush();
+
+    // No headings at all: one problem, so the counts downstream mean something.
+    if (!out.problems.length && out.instructions_latex) {
+        out.problems.push({
+            number: "1",
+            statement_latex: out.instructions_latex,
+            complete: true,
+        });
+        out.instructions_latex = "";
+    }
+    return out;
+}
+
 function toMarkdown(a: Assignment): string {
     const lines: string[] = [];
     if (a.title) lines.push(`# ${a.title}`, "");
@@ -1441,6 +1519,64 @@ const server = Bun.serve({
             return json({ ok: true, ...resetAssignment() });
         }
 
+        // An assignment you TYPED. No camera, no model call, no cost.
+        //
+        // It lands as a new version exactly as a photo or a scan does, so
+        // everything downstream — the glasses' Assignment page, the archive,
+        // the solve button — treats it as the assignment, because it is one.
+        // The previous attempt is archived, not lost.
+        //
+        // `done` is true and `full_page_seen` with it: those gates exist to stop
+        // the model claiming it has read a whole sheet it only saw two thirds
+        // of, and neither doubt applies to text you wrote out yourself.
+        if (path === "/assignment" && req.method === "POST") {
+            let body: any = {};
+            try {
+                body = (await req.json()) ?? {};
+            } catch {
+                return json({ ok: false, error: "expected a JSON body" }, 400);
+            }
+            const markdown = typeof body.markdown === "string" ? body.markdown.trim() : "";
+            if (!markdown) return json({ ok: false, error: "markdown is required" }, 400);
+            if (markdown.length > MAX_TEXT_CHARS) {
+                return json(
+                    { ok: false, error: `markdown is ${markdown.length} chars, limit is ${MAX_TEXT_CHARS}` },
+                    413,
+                );
+            }
+
+            const previous = resetAssignment();
+            state.assignment = fromMarkdown(markdown);
+            state.done = true;
+            state.full_page_seen = true;
+            state.updated_at = new Date().toISOString();
+            saveState();
+
+            emit("assignment_updated", {
+                capture: null,
+                needs_adjustment: false,
+                done: true,
+                problems: state.assignment.problems.length,
+                problems_complete: completeCount(),
+                full_page_seen: true,
+                source: "typed",
+                assignment: state.assignment,
+            });
+            emit("done", {
+                version: state.version,
+                problems: state.assignment.problems.length,
+                problems_complete: completeCount(),
+            });
+
+            return json({
+                ok: true,
+                version: state.version,
+                archived: previous.archived,
+                problems: state.assignment.problems.length,
+                assignment: state.assignment,
+            });
+        }
+
         // A photo, read as the whole assignment. The body IS the image — an
         // upload from the phone's gallery, see the companion app.
         //
@@ -1500,6 +1636,7 @@ const server = Bun.serve({
                     "GET /events",
                     "POST /capture",
                     "POST /photo",
+                    "POST /assignment",
                     "GET /assignment",
                     "GET /assignment.md",
                     "GET /state",
