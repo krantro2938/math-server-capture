@@ -15,6 +15,7 @@
  *   POST /stop             stop the running job
  *   GET  /events           SSE — live progress as the job works
  *   POST /capture          one single capture (manual/debug)
+ *   POST /photo            read a PHOTO as the assignment (image in the body)
  *   GET  /assignment       the assignment as JSON (what you're after)
  *   GET  /assignment.md    the same thing rendered as Markdown + LaTeX
  *   GET  /state            everything, incl. per-capture history
@@ -477,7 +478,11 @@ function worthFallback(status: number): boolean {
  *  other model might survive. A capture costs one API call, so the fallback is
  *  only ever a second call when the first genuinely failed — never a routine
  *  double-spend. */
-async function readFrame(jpeg: Buffer, note: string): Promise<GeminiResult> {
+async function readFrame(
+    jpeg: Buffer,
+    note: string,
+    mime = "image/jpeg",
+): Promise<GeminiResult> {
     if (!cfg.geminiKey) throw new Error("GEMINI_API_KEY is not set");
     const chain = cfg.modelFallback
         ? [cfg.model, cfg.modelFallback]
@@ -486,7 +491,7 @@ async function readFrame(jpeg: Buffer, note: string): Promise<GeminiResult> {
     let lastErr: any;
     for (let i = 0; i < chain.length; i++) {
         try {
-            return await callGemini(chain[i], jpeg, note);
+            return await callGemini(chain[i], jpeg, note, mime);
         } catch (e: any) {
             lastErr = e;
             const next = chain[i + 1];
@@ -508,6 +513,11 @@ async function callGemini(
     model: string,
     jpeg: Buffer,
     note: string,
+    // Camera frames are always JPEG; an uploaded photo is whatever the phone's
+    // gallery holds, and Gemini needs to be told which. Sending image/jpeg for
+    // a PNG works often enough to be a trap: it fails on the one HEIC shot you
+    // actually needed, long after this was written.
+    mime = "image/jpeg",
 ): Promise<GeminiResult> {
     const url = `${cfg.geminiBase}/v1beta/models/${model}:generateContent`;
     const res = await fetch(url, {
@@ -523,7 +533,7 @@ async function callGemini(
                     parts: [
                         {
                             inline_data: {
-                                mime_type: "image/jpeg",
+                                mime_type: mime,
                                 data: jpeg.toString("base64"),
                             },
                         },
@@ -739,11 +749,66 @@ function mergeAssignment(
     };
 }
 
+/** What Gemini accepts inline, and therefore what POST /photo accepts. */
+const GEMINI_IMAGE_TYPES = [
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+];
+
+/**
+ * Ceiling on an uploaded photo. Gemini's own inline limit is around 20MB for
+ * the whole request and base64 costs a third on top, so this leaves room for
+ * the prompt without ever being the thing that fails.
+ */
+const MAX_PHOTO_BYTES = Number(process.env.MAX_PHOTO_BYTES ?? 12_000_000);
+
+/**
+ * Archive the current attempt and start a clean one.
+ *
+ * Shared by POST /reset and POST /photo — a photo of a new sheet needs exactly
+ * this, and two copies of "which fields make a fresh version" is how one of
+ * them ends up forgetting `full_page_seen`.
+ */
+function resetAssignment(): { version: number; archived: boolean } {
+    const previous = state;
+    if (previous.job.running) {
+        // a reset implies "stop what you're doing"
+        previous.job.running = false;
+        wakeFromSleep?.();
+    }
+    if (previous.capture_count > 0) {
+        writeAtomic(
+            join(
+                ARCHIVE_DIR,
+                `v${previous.version}-${previous.created_at.replace(/[:.]/g, "-")}.json`,
+            ),
+            JSON.stringify(previous, null, 2),
+        );
+    }
+    state = newState(previous.version + 1);
+    saveState();
+    emit("reset", {
+        version: state.version,
+        archived: previous.capture_count > 0,
+    });
+    return { version: state.version, archived: previous.capture_count > 0 };
+}
+
 // One capture at a time: two overlapping calls would each merge against the same
 // "before" state and the second would clobber the first.
 let capturing = false;
 
-async function doCapture(note: string) {
+/**
+ * @param supplied A photo to read INSTEAD of grabbing one off the camera —
+ *        an upload from the phone's gallery (see POST /photo). Everything after
+ *        the grab is deliberately identical: the same model call, the same
+ *        merge, the same events, so a photographed sheet and a captured one are
+ *        the same kind of thing to every consumer downstream.
+ */
+async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
     if (capturing)
         throw Object.assign(new Error("a capture is already in progress"), {
             status: 409,
@@ -755,21 +820,24 @@ async function doCapture(note: string) {
         emit("capture_started", {
             n: state.capture_count + 1,
             note: note || null,
+            source: supplied ? "upload" : "camera",
         });
 
-        const jpeg = await grabFrame();
+        const jpeg = supplied ?? (await grabFrame());
+        // Written even for an upload: /frame.jpg is "the frame the last capture
+        // read", and after this one that is the photo.
         writeAtomic(FRAME_FILE, jpeg);
         emit("frame_grabbed", {
             bytes: jpeg.length,
             ms: Date.now() - startedAt,
-            source: cfg.snapshotUrl ? "gateway" : "rtsp",
+            source: supplied ? "upload" : cfg.snapshotUrl ? "gateway" : "rtsp",
         });
 
         // The model actually used may end up being the fallback — a
         // model_fallback event follows if it does.
         emit("model_request", { model: cfg.model });
         const modelStart = Date.now();
-        const result = await readFrame(jpeg, note);
+        const result = await readFrame(jpeg, note, mime);
         emit("model_response", {
             ms: Date.now() - modelStart,
             frame_quality: result.frame_quality,
@@ -1370,32 +1438,57 @@ const server = Bun.serve({
         // Start over. The old attempt is archived rather than deleted — flushing
         // progress shouldn't be able to destroy a transcription you wanted.
         if (path === "/reset" && req.method === "POST") {
-            const previous = state;
-            if (previous.job.running) {
-                // a reset implies "stop what you're doing"
-                previous.job.running = false;
-                wakeFromSleep?.();
-            }
-            if (previous.capture_count > 0) {
-                writeAtomic(
-                    join(
-                        ARCHIVE_DIR,
-                        `v${previous.version}-${previous.created_at.replace(/[:.]/g, "-")}.json`,
-                    ),
-                    JSON.stringify(previous, null, 2),
+            return json({ ok: true, ...resetAssignment() });
+        }
+
+        // A photo, read as the whole assignment. The body IS the image — an
+        // upload from the phone's gallery, see the companion app.
+        //
+        // It resets first (archiving whatever was there, exactly as /reset does)
+        // because a photo is a different sheet, not another look at the one the
+        // camera has been building up: merging it would interleave two
+        // assignments' problems into one document. `?reset=0` opts out for the
+        // case where it IS the same sheet, shot properly.
+        if (path === "/photo" && req.method === "POST") {
+            const mime = (req.headers.get("content-type") ?? "").split(";")[0]!.trim();
+            if (!GEMINI_IMAGE_TYPES.includes(mime)) {
+                return json(
+                    {
+                        ok: false,
+                        error: `send the image as the request body with one of: ${GEMINI_IMAGE_TYPES.join(", ")}`,
+                        got: mime || "(no content-type)",
+                    },
+                    415,
                 );
             }
-            state = newState(previous.version + 1);
-            saveState();
-            emit("reset", {
-                version: state.version,
-                archived: previous.capture_count > 0,
-            });
-            return json({
-                ok: true,
-                version: state.version,
-                archived: previous.capture_count > 0,
-            });
+
+            const photo = Buffer.from(await req.arrayBuffer());
+            if (photo.length === 0) return json({ ok: false, error: "empty body" }, 400);
+            if (photo.length > MAX_PHOTO_BYTES) {
+                // Refused rather than sent: the model's request has its own
+                // ceiling, and finding it costs a failed call and a long wait.
+                return json(
+                    {
+                        ok: false,
+                        error: `photo is ${(photo.length / 1e6).toFixed(1)}MB, limit is ${MAX_PHOTO_BYTES / 1e6}MB`,
+                    },
+                    413,
+                );
+            }
+
+            const note = url.searchParams.get("note") ?? "";
+            const reset = url.searchParams.get("reset") !== "0";
+            const previous = reset ? resetAssignment() : null;
+            try {
+                const result = await doCapture(note, photo, mime);
+                return json({ ok: true, reset: previous, ...result });
+            } catch (e: any) {
+                console.error("[!] photo capture failed:", e?.message ?? e);
+                return json(
+                    { ok: false, error: String(e?.message ?? e), reset: previous },
+                    e?.status ?? 502,
+                );
+            }
         }
 
         return json(
@@ -1406,6 +1499,7 @@ const server = Bun.serve({
                     "POST /stop",
                     "GET /events",
                     "POST /capture",
+                    "POST /photo",
                     "GET /assignment",
                     "GET /assignment.md",
                     "GET /state",

@@ -28,6 +28,7 @@ POST /start ─┐
 | `POST` | `/stop` | Stop the running job (idempotent, takes effect immediately) |
 | `GET` | `/events` | **SSE feed** — live progress while the job works (see below) |
 | `POST` | `/capture` | One single capture, no job. For a manual check or to debug framing. Optional body `{"note":"..."}` |
+| `POST` | `/photo` | **Read a PHOTO instead of the camera.** The request body IS the image (`image/jpeg\|png\|webp\|heic\|heif`). Resets first — a photo is a different sheet, and merging it into the transcription the camera has been building would interleave two assignments. `?reset=0` opts out, `?note=` passes a note |
 | `GET` | `/assignment` | The assignment as JSON — the thing you're after |
 | `GET` | `/assignment.md` | Same, rendered as Markdown + LaTeX |
 | `GET` | `/state` | Everything, including per-capture history |
@@ -220,6 +221,11 @@ Needs `ffmpeg` on PATH (the Docker image installs it).
    corrupt it. `assignment.json` is written alongside as a clean copy.
 5. `/reset` archives to `data/archive/v<n>-<timestamp>.json` before clearing —
    flushing progress can't destroy a transcription you meant to keep.
+
+A photo published through `POST /photo` is the same thing as a capture from
+there on: same model call, same merge, same events, so nothing downstream has to
+know where the frame came from. It is written to `/frame.jpg` too — that route
+means "the frame the last capture read", and after a photo, that is the photo.
 
 One capture runs at a time; a concurrent `POST /capture` gets `409` rather than
 racing to merge against stale state.
