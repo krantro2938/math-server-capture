@@ -179,6 +179,26 @@ const LOGIN = await Bun.file(new URL("./login.html", import.meta.url)).text();
 
 Bun.serve({
   port: CFG.port,
+
+  // Bun.serve closes a connection after `idleTimeout` seconds without traffic,
+  // AND THE DEFAULT IS 10. That default took this whole site down the day the
+  // message widget shipped: /api/messages/events is an SSE stream that is
+  // silent between messages, so Bun killed it from underneath itself every ten
+  // seconds — `[Bun.serve]: request timed out after 10 seconds` in this
+  // container's log, `EOF ... status 502` in Caddy's.
+  //
+  // It did not stop at the stream. Caddy keeps upstream connections alive and
+  // reuses them, so every connection Bun timed out was one Caddy still believed
+  // in: the next request on it — /live/index.m3u8, /api/messages, /api/doc/* —
+  // died at the same EOF without ever reaching this process. A live stream and
+  // two document tabs went 502 because of an endpoint neither of them touches.
+  //
+  // The evens document server hit exactly this and fixed it exactly here (see
+  // IDLE_TIMEOUT_S in evens/server/index.ts). Bun caps the value at 255s; 0
+  // would disable the timeout entirely, which is not what this wants — a
+  // genuinely dead connection should still be reaped.
+  idleTimeout: 120,
+
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
