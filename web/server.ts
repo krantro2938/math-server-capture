@@ -7,6 +7,8 @@
 //   - snapshot:    GET /api/snapshot.jpg -> one JPEG off the live stream, so
 //                  anything that wants a still (the assignment reader, a
 //                  dashboard, a cron job) asks HTTP instead of speaking RTSP
+//   - photo:       GET /api/photo[/meta] -> the sheet last published from the
+//                  companion app, shown and downloaded in the Photo tab
 //
 // Run with Bun:   bun run server.ts   (or `bun run start`)
 // Configure via env (see .env.example). Nothing here is camera-specific.
@@ -173,6 +175,24 @@ async function snapshot(maxAgeMs: number): Promise<Buffer> {
 const json = { "content-type": "application/json" };
 const html = { "content-type": "text/html; charset=utf-8" };
 
+// ---- filename for a downloaded photo ---------------------------------------
+// The page passes the name the phone knew (?name=IMG_4821.HEIC) so the file that
+// lands in Downloads is the one you took. Sanitised rather than trusted: it ends
+// up in a Content-Disposition header, where a quote or a newline is a header
+// injection and a slash is someone else's directory.
+const EXT: Record<string, string> = {
+  "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+  "image/heic": "heic", "image/heif": "heif",
+};
+
+function downloadName(url: URL, mime: string): string {
+  const raw = (url.searchParams.get("name") ?? "").split(/[\\/]/).pop() ?? "";
+  const safe = raw.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 80);
+  if (safe) return safe;
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  return `assignment-${stamp}.${EXT[mime.split(";")[0].trim()] ?? "jpg"}`;
+}
+
 // ---- routing ---------------------------------------------------------------
 const INDEX = await Bun.file(new URL("./index.html", import.meta.url)).text();
 const LOGIN = await Bun.file(new URL("./login.html", import.meta.url)).text();
@@ -338,6 +358,44 @@ Bun.serve({
           status: upstream.status,
           headers: json,
         });
+      } catch (e: any) {
+        return Response.json(
+          { ok: false, reason: `document server unreachable: ${e?.message ?? e}` },
+          { status: 502 },
+        );
+      }
+    }
+
+    // --- the photo published as the assignment ----------------------------
+    //
+    // Whatever was last uploaded in the companion app (or picked off the phone's
+    // gallery), so it can be looked at — and kept — from a real screen instead
+    // of a phone. Proxied for the same reason /api/doc is: the document server
+    // has no login, and this one does.
+    //
+    // It holds that photo IN MEMORY only, so a restart of the evens stack turns
+    // this into a 404 until the next publish. That is the document server's
+    // choice, not something to paper over here — the page says so.
+    if (path === "/api/photo" || path === "/api/photo/meta") {
+      const meta = path.endsWith("/meta");
+      try {
+        const upstream = await fetch(`${CFG.evensUrl}/assignment/photo${meta ? "/meta" : ""}`, {
+          signal: AbortSignal.timeout(30000),
+        });
+        if (meta) {
+          return new Response(await upstream.text(), { status: upstream.status, headers: json });
+        }
+        if (!upstream.ok) {
+          return new Response(await upstream.text(), { status: upstream.status, headers: json });
+        }
+        const type = upstream.headers.get("content-type") ?? "image/jpeg";
+        const headers = new Headers({ "content-type": type, "cache-control": "no-store" });
+        // ?download=1 turns the same bytes into a save — one fetch for the
+        // <img> and one for the button, rather than the page holding a blob.
+        if (url.searchParams.get("download") === "1") {
+          headers.set("content-disposition", `attachment; filename="${downloadName(url, type)}"`);
+        }
+        return new Response(upstream.body, { headers });
       } catch (e: any) {
         return Response.json(
           { ok: false, reason: `document server unreachable: ${e?.message ?? e}` },

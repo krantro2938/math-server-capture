@@ -31,9 +31,11 @@
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 14px 0; }
   input[type=date] { padding: 8px 10px; border-radius: 8px; border: 1px solid #2b2f37;
                      background: #14171c; color: #e7e9ee; font-size: 14px; }
-  button.btn { padding: 8px 14px; border-radius: 8px; border: 1px solid #2b2f37; background: #14171c;
-               color: #e7e9ee; cursor: pointer; font-size: 14px; }
-  button.btn:hover { border-color: #3b82f6; }
+  /* Not button-qualified: the photo download is an <a>, because letting the
+     browser save a URL beats holding a phone-sized blob in the page. */
+  .btn { padding: 8px 14px; border-radius: 8px; border: 1px solid #2b2f37; background: #14171c;
+         color: #e7e9ee; cursor: pointer; font-size: 14px; }
+  .btn:hover { border-color: #3b82f6; }
   button.golive { font-weight: 600; color: #f87171; border-color: #3a2426; }
   button.golive.behind { background: #ef4444; color: #fff; border-color: #ef4444; }
   /* Always-on latency readout. Fixed min-width + tabular figures so the row
@@ -64,6 +66,18 @@
     font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   .hidden { display: none; }
+
+  /* The published photo. Contained rather than cropped: it is a sheet of paper
+     photographed by hand, so the edges are where you find out whether the whole
+     thing is in frame. Capped at the viewport so a portrait phone shot doesn't
+     push the buttons under the fold. */
+  .photowrap { max-width: 860px; }
+  .photowrap h2 { margin: 0 0 4px; font-size: 17px; }
+  img.photo { max-width: 100%; max-height: 68vh; border-radius: 10px;
+              border: 1px solid #23262d; background: #000; display: block; }
+  a.btn { text-decoration: none; display: inline-block; }
+  a.btn.primary { border-color: #3b82f6; background: #1d4ed8; color: #fff; }
+  a.btn.disabled { opacity: .45; pointer-events: none; }
 
   /* ---- the glasses chat ---------------------------------------------------
      Fixed to the viewport rather than placed in a tab, because it has to be
@@ -120,6 +134,7 @@
     <button class="tab" data-tab="rec" id="tab-rec">Recordings</button>
     <button class="tab" data-tab="adri-assignment" id="tab-adri-assignment">Adri task</button>
     <button class="tab" data-tab="adri-solution" id="tab-adri-solution">Adri answer</button>
+    <button class="tab" data-tab="photo" id="tab-photo">Photo</button>
   </div>
   <span class="grow"></span>
   <a class="logout" href="/logout">Sign out</a>
@@ -175,6 +190,21 @@
         <button class="btn" id="save-adri-solution" disabled>Saved</button>
         <button class="btn" id="reload-adri-solution">Reload</button>
         <span class="hint" id="status-adri-solution"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- PHOTO: the sheet that was uploaded in the companion app, as published. -->
+  <section id="view-photo" class="hidden">
+    <div class="photowrap">
+      <h2>Assignment photo</h2>
+      <p class="hint">The photo last published from the phone &mdash; the one the reader transcribed. Publishing a new one replaces it.</p>
+      <p class="docmeta" id="meta-photo">Loading&hellip;</p>
+      <img class="photo hidden" id="photo-img" alt="the photo published as the assignment" />
+      <div class="row">
+        <a class="btn primary disabled" id="photo-download" download>Download</a>
+        <button class="btn" id="photo-reload">Refresh</button>
+        <span class="hint" id="status-photo"></span>
       </div>
     </div>
   </section>
@@ -501,7 +531,7 @@ function updateLiveLag() {
 // a second behind the thing it is measuring.
 setInterval(updateLiveLag, 500);
 
-const VIEWS = ["live", "rec", "adri-assignment", "adri-solution"];
+const VIEWS = ["live", "rec", "adri-assignment", "adri-solution", "photo"];
 
 document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
@@ -516,7 +546,58 @@ document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () 
 
   if (which === "rec" && !$("#segs").dataset.loaded) loadDay();
   if (which.startsWith("adri-")) loadDoc(which);
+  if (which === "photo") loadPhoto();
 }));
+
+// ---------- the published photo ----------
+//
+// Metadata first, bytes second: the meta call is cheap enough to run on every
+// visit to the tab, and it carries the timestamp that both cache-busts the
+// <img> and names the download. Asking for the bytes blind would re-download a
+// phone-sized photo each time you clicked the tab.
+
+async function loadPhoto() {
+  const img = $("#photo-img");
+  const meta = $("#meta-photo");
+  const dl = $("#photo-download");
+  $("#status-photo").textContent = "";
+  try {
+    const res = await fetch("/api/photo/meta");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const p = await res.json();
+    if (!p.published) {
+      img.classList.add("hidden");
+      img.removeAttribute("src");
+      dl.classList.add("disabled");
+      dl.removeAttribute("href");
+      // Worth spelling out: the usual cause is a restart, not a missing upload.
+      meta.textContent = "No photo published yet. The document server keeps only the "
+        + "most recent one, and forgets it when it restarts — publish again from the companion app.";
+      return;
+    }
+    const name = p.name || "";
+    const q = new URLSearchParams({ t: String(p.at) });
+    if (name) q.set("name", name);
+    img.src = "/api/photo?" + q;
+    img.classList.remove("hidden");
+    q.set("download", "1");
+    dl.href = "/api/photo?" + q;
+    // The attribute only steers the browser when it doesn't get a filename from
+    // the server; ours always does, so this is the fallback, not the source.
+    dl.setAttribute("download", name || "assignment-photo");
+    dl.classList.remove("disabled");
+    meta.textContent = [
+      name || "unnamed",
+      new Date(p.at).toLocaleString(),
+      (p.bytes / 1e6).toFixed(1) + " MB",
+      p.mime,
+    ].join(" · ");
+  } catch (e) {
+    $("#status-photo").textContent = "Could not load: " + e.message;
+  }
+}
+
+$("#photo-reload").addEventListener("click", () => loadPhoto());
 
 // ---------- the Adri documents ----------
 //
