@@ -156,7 +156,7 @@ remains as a last resort for when the AP interface is missing from `ip addr`.
 | `vps/transcode.sh` · `vps/install-transcode.sh` | VPS HEVC→H.264 transcode (only for `MODE=copy`) + its systemd unit |
 | `vps/setup-web.sh` | Install the web gateway + Caddy HTTPS |
 | `web/server.ts` · `web/index.html` | Bun gateway + SPA: password login, live + DVR, `GET /api/snapshot.jpg` (one still frame) |
-| `assignment/` | Reads an assignment off the paper via Gemini — one `POST /start`, SSE progress, LaTeX output |
+| `assignment/` | Reads an assignment off the paper via Gemini — one `POST /start`, SSE progress, LaTeX output. The sheet is covered by several close-up frames rather than fitted into one, and the model says where to point next |
 | `client.py` · `run_aiopppp.py` · `probe_cmds.py` · `pcap_*.py` | RE tools used to crack the protocol (kept for reference) |
 
 `stream` index: `0`=4K, `1`=2K/1080p, `2`=1080p (from the camera's `GetDevStream`).

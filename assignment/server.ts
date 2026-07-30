@@ -102,6 +102,24 @@ const ARCHIVE_DIR = join(cfg.dataDir, "archive");
 
 // ---------------------------------------------------------------- state -----
 
+/**
+ * The four edges of the sheet, which are the unit of coverage.
+ *
+ * The reader used to finish only once ONE frame had held the entire page. On a
+ * camera close enough to read handwriting that frame never arrives, so the job
+ * ran to its capture ceiling every time on a sheet it had in fact read
+ * completely. Coverage is the replacement: each frame reports which edges of
+ * the paper it can see, the union accumulates across frames, and having seen
+ * all four — in however many looks it took — is what "the whole sheet" means
+ * now.
+ */
+const SHEET_EDGES = ["top", "bottom", "left", "right"] as const;
+type Edge = (typeof SHEET_EDGES)[number];
+
+/** How many region labels to keep. They exist to tell the model what it has
+ *  already covered, and a prompt is not the place for an unbounded list. */
+const MAX_REGIONS = 12;
+
 type Problem = { number: string; statement_latex: string; complete: boolean };
 type Assignment = {
     title: string;
@@ -124,6 +142,15 @@ type CaptureLog = {
     camera_advice: string;
     advice_detail: string;
     cut_off_edges: string[];
+    /** Edges of the PAPER this frame held. Optional for the same reason as
+     *  `provider`: state.json written before coverage existed has none. */
+    sheet_edges_visible?: string[];
+    /** Where on the sheet this frame sat, in the model's words. */
+    region?: string;
+    /** Directions in which writing ran off this frame. */
+    more_content_beyond?: string[];
+    /** Where to aim next — the nudge, and the reason this whole field exists. */
+    next_target?: string;
     changes: string[];
     confidence: number;
 };
@@ -148,12 +175,30 @@ type State = {
     /**
      * Whether ANY frame in this attempt has shown the whole sheet.
      *
-     * The gate on `done`. Every other signal is about the problems we have; this
-     * is the only one that says anything about problems we might not — a model
-     * looking at the top two thirds of a page can call what it sees complete
-     * and be perfectly right and still be missing problem 25.
+     * No longer the gate — `edges_seen` is — but still worth recording and
+     * still sufficient on its own: a frame that held the entire page has by
+     * definition covered every edge of it.
      */
     full_page_seen: boolean;
+    /**
+     * Every edge of the paper any frame in this attempt has seen, unioned.
+     *
+     * THE GATE ON `done`, and the point of the coverage model. Every other
+     * signal is about the problems we have; this is the only one that says
+     * anything about problems we might not — a model looking at the top two
+     * thirds of a page can call what it sees complete and be perfectly right
+     * and still be missing problem 25. It no longer has to see all of that in
+     * one frame, only over the course of the scan.
+     */
+    edges_seen: Edge[];
+    /** The regions the model says it has read, newest last, capped. Fed back to
+     *  it so a scan doesn't circle the same corner of the page. */
+    regions_seen: string[];
+    /** Where the model last asked the operator to point. */
+    next_target: string;
+    /** Directions the LAST frame said writing continued in. Non-empty means
+     *  there is known-unread paper, whatever the edge count says. */
+    open_edges: Edge[];
     assignment: Assignment;
     captures: CaptureLog[];
     job: Job;
@@ -184,6 +229,10 @@ const newState = (version: number): State => ({
     capture_count: 0,
     done: false,
     full_page_seen: false,
+    edges_seen: [],
+    regions_seen: [],
+    next_target: "",
+    open_edges: [],
     assignment: emptyAssignment(),
     captures: [],
     job: idleJob(),
@@ -206,6 +255,21 @@ function loadState(): State {
             ) as State;
             loaded.job = { ...idleJob(), ...(loaded.job ?? {}) }; // state.json from an older build
             loaded.full_page_seen = Boolean(loaded.full_page_seen); // ditto
+            // Coverage, for a file written before it existed. A scan that had
+            // already seen the whole page in one frame has, by definition, seen
+            // all four of its edges — so it carries its finished status across
+            // rather than being sent back to hunt for edges it already had.
+            loaded.edges_seen = Array.isArray(loaded.edges_seen)
+                ? asEdges(loaded.edges_seen)
+                : loaded.full_page_seen
+                  ? [...SHEET_EDGES]
+                  : [];
+            loaded.regions_seen = Array.isArray(loaded.regions_seen)
+                ? loaded.regions_seen.filter((r: unknown) => typeof r === "string")
+                : [];
+            loaded.next_target =
+                typeof loaded.next_target === "string" ? loaded.next_target : "";
+            loaded.open_edges = asEdges(loaded.open_edges);
             return loaded;
         }
     } catch (e) {
@@ -361,6 +425,17 @@ const RESPONSE_SCHEMA = {
             type: "object",
             properties: {
                 full_page_visible: { type: "boolean" },
+                // Which PHYSICAL EDGES of the sheet are inside this frame. The
+                // whole point of the coverage model: these accumulate across
+                // frames, so a sheet read in two halves ends up having had all
+                // four of its edges seen without any single frame holding them.
+                sheet_edges_visible: {
+                    type: "array",
+                    items: {
+                        type: "string",
+                        enum: ["top", "bottom", "left", "right"],
+                    },
+                },
                 cut_off_edges: {
                     type: "array",
                     items: {
@@ -387,10 +462,29 @@ const RESPONSE_SCHEMA = {
             },
             required: [
                 "full_page_visible",
+                "sheet_edges_visible",
                 "cut_off_edges",
                 "camera_advice",
                 "advice_detail",
             ],
+        },
+        // Where this frame sat on the sheet, and where the operator should aim
+        // next. `framing` answers "is this frame any good"; this answers "what
+        // is still unread, and how do I get it in front of the lens".
+        coverage: {
+            type: "object",
+            properties: {
+                region: { type: "string" },
+                more_content_beyond: {
+                    type: "array",
+                    items: {
+                        type: "string",
+                        enum: ["top", "bottom", "left", "right"],
+                    },
+                },
+                next_target: { type: "string" },
+            },
+            required: ["region", "more_content_beyond", "next_target"],
         },
         assignment: {
             type: "object",
@@ -420,6 +514,7 @@ const RESPONSE_SCHEMA = {
     required: [
         "frame_quality",
         "framing",
+        "coverage",
         "assignment",
         "changes",
         "confidence",
@@ -429,14 +524,39 @@ const RESPONSE_SCHEMA = {
 
 function buildPrompt(note: string): string {
     const soFar = JSON.stringify(state.assignment, null, 2);
-    return `You are reading a school assignment from a single frame of a ceiling-mounted camera pointed at a sheet of paper on a desk.
+    const edges = state.edges_seen.length
+        ? state.edges_seen.join(", ")
+        : "none yet";
+    const missing = SHEET_EDGES.filter((e) => !state.edges_seen.includes(e));
+    const regions = state.regions_seen.length
+        ? state.regions_seen.join(" | ")
+        : "none yet";
+    const partial = (state.assignment.problems ?? [])
+        .filter((p) => !p.complete)
+        .map((p) => p.number);
+
+    return `You are reading a school assignment from a single frame of a camera pointed at a sheet of paper.
+
+THE SHEET IS READ A PIECE AT A TIME
+You will NOT be shown the whole sheet at once, and you must not ask for it. The
+operator cannot back the camera off far enough to fit the page and still leave
+the writing legible — that is the constraint this whole process exists inside.
+So the assignment is assembled from a SEQUENCE of overlapping close-up frames,
+each one contributing the part of the page it can actually read, into one
+document that grows until the whole sheet has been covered.
 
 YOUR TWO JOBS
-1. TRANSCRIBE the assignment exactly as written — every problem, in order.
-2. JUDGE THE FRAMING and tell the operator how to move the camera so the ENTIRE
-   sheet becomes visible. Be decisive: if the top of the page is cut off, the
-   camera must move up (camera_advice="move_up"). If text is too small or
-   unreadable, "move_closer". If nothing readable is in frame, "no_paper".
+1. TRANSCRIBE what is legible in THIS frame, folded into the one document you
+   have been building (below).
+2. AIM THE NEXT FRAME. Say which part of the sheet has not been read yet and
+   which way the camera must move to bring it into view.
+
+A CLOSE, READABLE PART OF THE PAGE BEATS A DISTANT VIEW OF ALL OF IT.
+Never answer "move_farther" merely because the sheet does not fit in frame —
+that is the expected, correct state. Use "move_farther" only when the writing
+is so large that very little text fits, or you cannot tell where on the sheet
+you are. If the text is too small to read exactly, say "move_closer" and
+transcribe nothing you had to guess.
 
 MATH MUST BE LaTeX, PROSE MUST NOT BE
 Every mathematical symbol, fraction, exponent, root, integral, matrix or
@@ -454,20 +574,49 @@ statement_latex must contain at least one $ if it contains any mathematics.
 The wrong form cannot be rendered or read by anything downstream.
 
 THIS IS ONE CONTINUING TRANSCRIPTION
-You have seen earlier frames of the SAME assignment. Here is the transcription
-so far (JSON):
+You have seen earlier frames of the SAME sheet. Here is the transcription so
+far (JSON):
 
 ${soFar}
 
 Return the COMPLETE, UPDATED transcription — not just the new bits:
 - Keep everything already correct; do not drop problems you can no longer see.
+  A problem that is off-frame now was read from an earlier frame and still
+  belongs to this assignment.
 - Fix mistakes and fill in parts that were previously cut off or unreadable.
+- JOIN UP a problem you are holding half of. If this frame shows the rest of a
+  problem already listed as complete=false, return the two halves as one
+  statement and set complete=true. Never return only the fragment you can see
+  now — that would throw away the half you already have.
 - Do not duplicate a problem that is already listed; match by its number.
 - Mark a problem complete=false if you can only see part of its statement.
-- List what this frame changed in "changes" (e.g. "added problem 4", "fixed
-  exponent in problem 2"). If nothing changed, return an empty array.
-- Set done=true only when every problem is complete and the whole sheet has
-  been seen.
+- List what this frame changed in "changes" (e.g. "added problem 4", "joined
+  the two halves of problem 2"). If nothing changed, return an empty array.
+
+WHAT HAS BEEN COVERED SO FAR
+Sheet edges seen across all frames so far: ${edges}${missing.length ? ` — still missing: ${missing.join(", ")}` : " — all four"}
+Parts of the sheet already read: ${regions}
+Problems still incomplete: ${partial.length ? partial.join(", ") : "none"}
+
+FILL IN "coverage" — this is what the operator acts on:
+- "region": where THIS frame sits on the sheet, in a few words, in the sheet's
+  own terms ("top third", "left column, middle", "below problem 7").
+- "more_content_beyond": the directions in which writing clearly continues past
+  the edge of this frame. Empty only when you can see this frame's content ends
+  the sheet on every side.
+- "next_target": one short sentence telling the operator where to point next,
+  naming the part of the sheet you still need ("show the bottom of the page,
+  below problem 7"). When nothing is left to read, say so instead.
+And in "framing", "sheet_edges_visible": which physical EDGES of the paper are
+inside this frame — where the paper stops and the desk begins. Report only
+edges you can actually see; the border of the frame is not an edge of the sheet.
+
+WHEN IS IT DONE
+Set done=true when the whole sheet has been read ACROSS ALL FRAMES — every
+problem complete, every part of the paper seen by some frame, and nothing
+continuing past an edge you have not looked at. This frame does not have to
+contain the whole sheet. Do not set done=true while any edge of the paper is
+still unseen or any problem is still incomplete.
 ${note ? `\nOPERATOR NOTE FOR THIS FRAME: ${note}\n` : ""}`;
 }
 
@@ -475,15 +624,55 @@ type GeminiResult = {
     frame_quality: string;
     framing: {
         full_page_visible: boolean;
+        sheet_edges_visible: string[];
         cut_off_edges: string[];
         camera_advice: string;
         advice_detail: string;
+    };
+    coverage: {
+        region: string;
+        more_content_beyond: string[];
+        next_target: string;
     };
     assignment: Assignment;
     changes: string[];
     confidence: number;
     done: boolean;
 };
+
+/**
+ * The edge lists, as this server is willing to believe them.
+ *
+ * The schema constrains these upstream, but `coverage` and `sheet_edges_visible`
+ * are newer than some of the readers in the chain and than every state.json
+ * already on disk — and an edge name nobody recognises quietly poisons the
+ * coverage set that gates `done`. Filtered and deduped here, once, so nothing
+ * below has to wonder.
+ */
+function asEdges(value: unknown): Edge[] {
+    if (!Array.isArray(value)) return [];
+    const out: Edge[] = [];
+    for (const v of value) {
+        if (SHEET_EDGES.includes(v as Edge) && !out.includes(v as Edge)) {
+            out.push(v as Edge);
+        }
+    }
+    return out;
+}
+
+/** Coverage as reported, with the blanks filled in — see asEdges. */
+function asCoverage(result: GeminiResult): {
+    region: string;
+    more_content_beyond: Edge[];
+    next_target: string;
+} {
+    const c = result.coverage ?? ({} as GeminiResult["coverage"]);
+    return {
+        region: typeof c.region === "string" ? c.region.trim() : "",
+        more_content_beyond: asEdges(c.more_content_beyond),
+        next_target: typeof c.next_target === "string" ? c.next_target.trim() : "",
+    };
+}
 
 /** Whether trying the next model can plausibly help. A rejected id, a
  *  rate-limited model or a transient upstream failure are all worth another
@@ -852,6 +1041,13 @@ const snapshot = () => ({
     // a bare problem count cannot say.
     problems_complete: completeCount(),
     full_page_seen: state.full_page_seen,
+    // How much of the paper has been looked at, and where to look next — the
+    // pair a client needs to show progress on a scan that is assembled from
+    // partial views rather than one photograph.
+    edges_seen: state.edges_seen,
+    edges_unseen: SHEET_EDGES.filter((e) => !state.edges_seen.includes(e)),
+    open_edges: state.open_edges,
+    next_target: state.next_target,
     last_capture: state.captures.at(-1) ?? null,
 });
 
@@ -939,12 +1135,18 @@ function mergeAssignment(
             kept.push(p.number);
             continue;
         }
-        // Both finished: take the newer reading, which is usually a refinement —
-        // unless most of the text vanished, which is not a refinement.
+        // Take the newer reading, which is usually a refinement — unless most
+        // of the text vanished, which is not a refinement.
+        //
+        // Applied to a pair of INCOMPLETE readings too, which matters more
+        // under the coverage model than it used to: a problem straddling two
+        // frames is held half-read, and the frame that shows its second half
+        // may return only that half. Keeping the longer text means the halves
+        // accumulate instead of overwriting each other while the model works
+        // towards returning them joined.
         if (
-            old.complete &&
-            p.complete &&
-            p.statement_latex.length < old.statement_latex.length * 0.6
+            p.statement_latex.length < old.statement_latex.length * 0.6 &&
+            old.statement_latex.length > 0
         ) {
             kept.push(p.number);
             continue;
@@ -1078,6 +1280,8 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
         });
         const modelStart = Date.now();
         const { result, used } = await readFrame(jpeg, note, mime);
+        const coverage = asCoverage(result);
+        const edgesThisFrame = asEdges(result.framing.sheet_edges_visible);
         emit("model_response", {
             ms: Date.now() - modelStart,
             provider: used.provider,
@@ -1087,6 +1291,10 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             advice_detail: result.framing.advice_detail,
             full_page_visible: result.framing.full_page_visible,
             cut_off_edges: result.framing.cut_off_edges ?? [],
+            sheet_edges_visible: edgesThisFrame,
+            region: coverage.region,
+            more_content_beyond: coverage.more_content_beyond,
+            next_target: coverage.next_target,
             changes: result.changes ?? [],
             confidence: result.confidence,
             done: result.done,
@@ -1118,9 +1326,28 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             kept = merge.kept;
         }
 
-        if (result.framing.full_page_visible) state.full_page_seen = true;
+        // Coverage accumulates whether or not the transcription moved: a frame
+        // that added no text still proves the operator has looked at that part
+        // of the sheet, and that is the whole basis for ever finishing.
+        if (usable) {
+            if (result.framing.full_page_visible) {
+                state.full_page_seen = true;
+                for (const e of SHEET_EDGES) {
+                    if (!state.edges_seen.includes(e)) state.edges_seen.push(e);
+                }
+            }
+            for (const e of edgesThisFrame) {
+                if (!state.edges_seen.includes(e)) state.edges_seen.push(e);
+            }
+            if (coverage.region && !state.regions_seen.includes(coverage.region)) {
+                state.regions_seen.push(coverage.region);
+                if (state.regions_seen.length > MAX_REGIONS) state.regions_seen.shift();
+            }
+            state.open_edges = coverage.more_content_beyond;
+            state.next_target = coverage.next_target;
+        }
 
-        // `done` is a claim, and it is now checked rather than believed.
+        // `done` is a claim, and it is checked rather than believed.
         //
         // The model can only speak for what it can see. Asked "is the whole
         // assignment captured?" while looking at the top two thirds of a sheet,
@@ -1130,27 +1357,36 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
         // and the only sign is a solution that answers fewer problems than the
         // paper has.
         //
-        // So finishing needs all three: the model says so, every problem we hold
-        // is complete, and at some point this attempt has seen the whole sheet
-        // in one frame. If the camera never shows the whole page the job never
-        // self-completes, which is correct — it hasn't read the whole page —
-        // and max_captures still bounds the cost while the glasses say which way
-        // to move the camera.
+        // The check used to be `full_page_seen`: one frame holding the entire
+        // sheet. On a camera close enough to read handwriting that frame never
+        // comes, so a scan that HAD read the whole page could not say so, and
+        // every job ran to its ceiling. The gate is now coverage — all four
+        // edges of the paper seen across however many frames it took — plus the
+        // model not reporting writing that runs off an edge of the last frame.
+        // Same guarantee, without demanding a photograph nobody can take.
         const problems = state.assignment.problems ?? [];
         const allComplete = problems.length > 0 && problems.every((p) => p.complete);
+        const covered = SHEET_EDGES.every((e) => state.edges_seen.includes(e));
+        const outstanding = state.open_edges.length > 0;
         state.done =
-            Boolean(result.done) && usable && allComplete && state.full_page_seen;
+            Boolean(result.done) && usable && allComplete && covered && !outstanding;
 
         if (result.done && !state.done) {
+            const unseen = SHEET_EDGES.filter((e) => !state.edges_seen.includes(e));
             emit("done_rejected", {
                 reason: !usable
                     ? "no paper in frame"
                     : !allComplete
                       ? "not every problem is complete"
-                      : "the whole sheet has never been in frame",
+                      : !covered
+                        ? `these edges of the sheet have never been in frame: ${unseen.join(", ")}`
+                        : `content continues past the frame: ${state.open_edges.join(", ")}`,
                 problems: problems.length,
                 problems_complete: completeCount(),
                 full_page_seen: state.full_page_seen,
+                edges_seen: state.edges_seen,
+                edges_unseen: unseen,
+                open_edges: state.open_edges,
             });
         }
 
@@ -1164,15 +1400,26 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             camera_advice: result.framing.camera_advice,
             advice_detail: result.framing.advice_detail,
             cut_off_edges: result.framing.cut_off_edges ?? [],
+            sheet_edges_visible: edgesThisFrame,
+            region: coverage.region,
+            more_content_beyond: coverage.more_content_beyond,
+            next_target: coverage.next_target,
             changes: result.changes ?? [],
             confidence: result.confidence,
         };
         state.captures.push(log);
         saveState();
 
+        // "Adjustment" now means "there is more sheet to bring into view", not
+        // "the whole page isn't in frame" — under the coverage model the latter
+        // is the normal state of every good capture, and reporting it as a
+        // problem would have the operator forever chasing a shot that doesn't
+        // exist.
         const needs_adjustment =
-            !result.framing.full_page_visible ||
-            result.framing.camera_advice !== "ok";
+            !state.done &&
+            (result.framing.camera_advice !== "ok" ||
+                state.open_edges.length > 0 ||
+                !SHEET_EDGES.every((e) => state.edges_seen.includes(e)));
         emit("assignment_updated", {
             capture: log,
             needs_adjustment,
@@ -1180,6 +1427,9 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             problems: state.assignment.problems?.length ?? 0,
             problems_complete: completeCount(),
             full_page_seen: state.full_page_seen,
+            edges_seen: state.edges_seen,
+            open_edges: state.open_edges,
+            next_target: state.next_target,
             // Problems whose older reading we preferred to this frame's.
             kept: kept.length ? kept : undefined,
             assignment: state.assignment,
@@ -1677,6 +1927,19 @@ const server = Bun.serve({
                 capture_count: state.capture_count,
                 done: state.done,
                 job: { running: state.job.running, reason: state.job.reason },
+                // Why it is or isn't finished, next to the thing itself: a
+                // caller holding a `done: false` assignment needs to know
+                // whether that means "half transcribed" or "read, but one edge
+                // of the paper was never looked at".
+                coverage: {
+                    edges_seen: state.edges_seen,
+                    edges_unseen: SHEET_EDGES.filter(
+                        (e) => !state.edges_seen.includes(e),
+                    ),
+                    open_edges: state.open_edges,
+                    next_target: state.next_target,
+                    regions_seen: state.regions_seen,
+                },
                 assignment: state.assignment,
             });
         }
@@ -1755,6 +2018,66 @@ const server = Bun.serve({
             return json({ ok: true, ...resetAssignment() });
         }
 
+        // "That's all of it" — said by the operator, not the model.
+        //
+        // The coverage gate is an inference from what a model reports about
+        // paper it is looking at, and it can be wrong in the direction that
+        // costs the most: a sheet whose bottom edge is a torn line the model
+        // won't call an edge leaves the scan one edge short of finishing
+        // forever, spending a capture a second on a page it has entirely read.
+        // The person holding the camera can see that in an instant, and this is
+        // how they say so. It spends no API call and reads no frame — it only
+        // stops the job and marks what has already been transcribed as final.
+        if (path === "/complete" && req.method === "POST") {
+            if (!(state.assignment.problems ?? []).length) {
+                return json(
+                    {
+                        ok: false,
+                        error: "nothing has been transcribed yet — there is nothing to mark complete",
+                    },
+                    409,
+                );
+            }
+            if (state.job.running) {
+                state.job.running = false;
+                wakeFromSleep?.();
+                finishJob("stopped");
+            }
+            state.done = true;
+            // Coverage is now a statement of fact by the operator, so the gate
+            // agrees with it rather than being left to contradict it in /state.
+            state.edges_seen = [...SHEET_EDGES];
+            state.open_edges = [];
+            state.next_target = "";
+            saveState();
+            emit("assignment_updated", {
+                capture: null,
+                needs_adjustment: false,
+                done: true,
+                problems: state.assignment.problems.length,
+                problems_complete: completeCount(),
+                full_page_seen: state.full_page_seen,
+                edges_seen: state.edges_seen,
+                open_edges: [],
+                next_target: "",
+                source: "operator",
+                assignment: state.assignment,
+            });
+            emit("done", {
+                version: state.version,
+                problems: state.assignment.problems.length,
+                problems_complete: completeCount(),
+                by: "operator",
+            });
+            return json({
+                ok: true,
+                version: state.version,
+                done: true,
+                problems: state.assignment.problems.length,
+                assignment: state.assignment,
+            });
+        }
+
         // An assignment you TYPED. No camera, no model call, no cost.
         //
         // It lands as a new version exactly as a photo or a scan does, so
@@ -1762,9 +2085,9 @@ const server = Bun.serve({
         // the solve button — treats it as the assignment, because it is one.
         // The previous attempt is archived, not lost.
         //
-        // `done` is true and `full_page_seen` with it: those gates exist to stop
-        // the model claiming it has read a whole sheet it only saw two thirds
-        // of, and neither doubt applies to text you wrote out yourself.
+        // `done` is true and the coverage gates with it: they exist to stop the
+        // model claiming it has read a whole sheet it only saw two thirds of,
+        // and no such doubt applies to text you wrote out yourself.
         if (path === "/assignment" && req.method === "POST") {
             let body: any = {};
             try {
@@ -1785,6 +2108,7 @@ const server = Bun.serve({
             state.assignment = fromMarkdown(markdown);
             state.done = true;
             state.full_page_seen = true;
+            state.edges_seen = [...SHEET_EDGES];
             state.updated_at = new Date().toISOString();
             saveState();
 
@@ -1795,6 +2119,9 @@ const server = Bun.serve({
                 problems: state.assignment.problems.length,
                 problems_complete: completeCount(),
                 full_page_seen: true,
+                edges_seen: state.edges_seen,
+                open_edges: [],
+                next_target: "",
                 source: "typed",
                 assignment: state.assignment,
             });
@@ -1813,14 +2140,18 @@ const server = Bun.serve({
             });
         }
 
-        // A photo, read as the whole assignment. The body IS the image — an
-        // upload from the phone's gallery, see the companion app.
+        // A photo, read into the assignment. The body IS the image — an upload
+        // from the phone's gallery, see the companion app.
         //
-        // It resets first (archiving whatever was there, exactly as /reset does)
-        // because a photo is a different sheet, not another look at the one the
-        // camera has been building up: merging it would interleave two
-        // assignments' problems into one document. `?reset=0` opts out for the
-        // case where it IS the same sheet, shot properly.
+        // IT MERGES, and that default is the opposite of what it once was. A
+        // photo used to reset first, on the reasoning that a photo is a
+        // different sheet and merging it would interleave two assignments. But
+        // the ordinary way to read a sheet no camera can frame in one shot is
+        // several photos of it — top, then bottom, then the corner that was in
+        // shadow — and under the old default each one threw away the last. So
+        // photos now accumulate exactly as camera frames do, and `?reset=1`
+        // says "this is a different sheet, start over" for the case that
+        // genuinely is one. (`?reset=0`, the old opt-out, still means merge.)
         if (path === "/photo" && req.method === "POST") {
             const mime = (req.headers.get("content-type") ?? "").split(";")[0]!.trim();
             if (!GEMINI_IMAGE_TYPES.includes(mime)) {
@@ -1849,7 +2180,7 @@ const server = Bun.serve({
             }
 
             const note = url.searchParams.get("note") ?? "";
-            const reset = url.searchParams.get("reset") !== "0";
+            const reset = url.searchParams.get("reset") === "1";
             const previous = reset ? resetAssignment() : null;
             try {
                 const result = await doCapture(note, photo, mime);
@@ -1879,6 +2210,7 @@ const server = Bun.serve({
                     "GET /frame.jpg",
                     "GET /snapshot.jpg",
                     "POST /reset",
+                    "POST /complete",
                     "GET /archive",
                     "GET /archive/:version",
                     "GET /archive/:version.md",

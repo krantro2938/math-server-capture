@@ -4,7 +4,7 @@ Point the camera at a sheet of paper and fire **one** `POST /start`. The service
 then runs a background job — grab a frame → send it to Gemini → wait a second →
 again — until the model says it has the whole assignment. You get it back as
 structured JSON with all math in LaTeX, plus a straight answer at every step
-about whether the page is fully in frame or the camera needs to move.
+about which part of the sheet still needs to be shown to the camera.
 
 Every pass sees what has already been transcribed, so the job refines **one**
 document instead of producing N independent guesses. State is written to disk
@@ -20,6 +20,40 @@ POST /start ─┐
              └─► returns immediately (202); watch GET /events
 ```
 
+## The sheet is read a piece at a time
+
+**No frame has to hold the whole page.** A camera close enough to read
+handwriting cannot fit an A4 sheet in one shot, and demanding one was the
+reader's central mistake: the transcription would be finished and correct while
+`done` stayed false, because no single frame had ever shown the page end to end,
+and every job ran to its capture ceiling.
+
+So the sheet is covered rather than photographed. Each frame reports which
+**edges of the paper** it can see, and the union accumulates across the whole
+attempt:
+
+```
+frame 1: top ▔▔▔▔  sees top, left, right     edges seen: top left right
+frame 2: bottom ▁▁ sees bottom, left, right  edges seen: ALL FOUR → covered
+```
+
+Two close-up frames, neither of them containing the sheet, and between them the
+paper has been seen from edge to edge. That — plus every problem complete, plus
+the model reporting no writing running off a frame it hasn't followed — is what
+`done` now means.
+
+Meanwhile the model says **where to point next**: `coverage.next_target` is one
+sentence naming the part of the sheet it still needs ("show the bottom of the
+page, below problem 7"), and `camera_advice` is the move that gets you there.
+The prompt is explicit that a close, readable part of the page beats a distant
+view of all of it — "move_farther" is for text so large you can't tell where you
+are, never for making the sheet fit.
+
+If the gate is wrong — a torn edge the model won't call an edge, a sheet that
+runs under the edge of the desk — `POST /complete` is the operator saying
+"that's all of it". No API call, no frame: it stops the job and marks what has
+been transcribed as final.
+
 ## Endpoints
 
 | Method | Path | Does |
@@ -28,8 +62,9 @@ POST /start ─┐
 | `POST` | `/stop` | Stop the running job (idempotent, takes effect immediately) |
 | `GET` | `/events` | **SSE feed** — live progress while the job works (see below) |
 | `POST` | `/capture` | One single capture, no job. For a manual check or to debug framing. Optional body `{"note":"..."}` |
-| `POST` | `/photo` | **Read a PHOTO instead of the camera.** The request body IS the image (`image/jpeg\|png\|webp\|heic\|heif`). Resets first — a photo is a different sheet, and merging it into the transcription the camera has been building would interleave two assignments. `?reset=0` opts out, `?note=` passes a note |
-| `GET` | `/assignment` | The assignment as JSON — the thing you're after |
+| `POST` | `/photo` | **Read a PHOTO instead of the camera.** The request body IS the image (`image/jpeg\|png\|webp\|heic\|heif`). **Merges** into the current assignment, exactly as a camera frame does — several photos of one sheet is the ordinary way to read it. `?reset=1` starts a new version instead (a different sheet), `?note=` passes a note |
+| `POST` | `/complete` | **"That's all of it."** Marks the current transcription final without a frame or an API call. The override for when the coverage gate can't be satisfied |
+| `GET` | `/assignment` | The assignment as JSON — the thing you're after, plus a `coverage` block saying what is still unseen |
 | `GET` | `/assignment.md` | Same, rendered as Markdown + LaTeX |
 | `GET` | `/state` | Everything, including per-capture history |
 | `GET` | `/frame.jpg` | The last frame grabbed (see what the model saw) |
@@ -62,6 +97,11 @@ Guard rails worth knowing:
   API call, and a camera pointed at a blank desk never reaches `done` — without
   the cap the job would bill forever. It counts captures for the current
   version, so resuming after a crash spends the *original* budget, not a fresh one.
+- **A job that ends on `max_captures` with the transcription looking finished**
+  usually means an edge of the sheet was never shown to the camera. `GET
+  /assignment` names which one in `coverage.edges_unseen` — point the camera
+  there and `/start` again, or `POST /complete` if the paper really does end
+  there.
 - **`/start` on a finished assignment returns `409`**, telling you to `/reset`
   first, rather than quietly spending a call to re-confirm what's already known.
 - **`/start` while a job runs returns `409`** — one job at a time.
@@ -78,21 +118,28 @@ act on:
   "ok": true,
   "capture": {
     "n": 1,
+    "next_target": "Show the bottom of the page, below problem 7.",
     "camera_advice": "move_down",          // ok | move_up | move_down | move_left |
-    "advice_detail": "The lower third of the sheet is out of frame; tilt down.",
-    "cut_off_edges": ["bottom"],           //   move_right | move_closer | move_farther |
-    "frame_quality": "good",               //   refocus | reduce_glare | reposition_paper
+    "advice_detail": "Problem 8 starts below the frame.",
+    "region": "top two thirds",            //   move_right | move_closer | move_farther |
+    "sheet_edges_visible": ["top","left","right"],  // refocus | reduce_glare |
+    "more_content_beyond": ["bottom"],     //   reposition_paper
+    "cut_off_edges": ["bottom"],
+    "frame_quality": "good",
     "changes": ["added problem 1"],
     "confidence": 0.6
   },
-  "needs_adjustment": true,   // false once the full page is visible and framing is ok
+  "needs_adjustment": true,   // false once the whole sheet has been covered
   "done": false,              // true when the model has the whole assignment
   "assignment": { "title": "...", "problems": [ ... ] }
 }
 ```
 
-The job keeps capturing on its own; `camera_advice` tells *you* how to nudge the
-camera between passes, and the next capture picks up the improvement.
+`next_target` is the sentence to act on and `camera_advice` is the direction to
+move; `sheet_edges_visible` is what this frame contributed to coverage, and
+`more_content_beyond` is the model saying it can see the writing continue past
+the frame. The job keeps capturing on its own, so the next pass picks up
+wherever you moved to.
 
 ## Live feedback: `GET /events`
 
@@ -119,18 +166,19 @@ curl -N "http://127.0.0.1:8091/events?token=$TOKEN"     # watch from a terminal
 
 | Event | When | Payload |
 |---|---|---|
-| `snapshot` | on connect | version, capture count, `done`, live `job` status |
+| `snapshot` | on connect | version, capture count, `done`, live `job` status, `edges_seen`/`edges_unseen`, `next_target` |
 | `job_started` | `/start` | `interval_ms`, `max_captures`, `note` |
 | `job_resumed` | restart after a crash | `from_capture`, `max_captures` |
 | `capture_started` | each pass begins | `n`, operator `note` |
 | `frame_grabbed` | frame is in hand | `bytes`, `ms` |
 | `model_request` | request sent | `model` |
-| `model_response` | model replied | `camera_advice`, `advice_detail`, `cut_off_edges`, `changes`, `confidence`, `done`, `ms` |
-| `assignment_updated` | state merged + saved | the full capture log + updated `assignment` |
-| `done` | model says it has it all | `version`, problem count |
+| `model_response` | model replied | `next_target`, `camera_advice`, `advice_detail`, `region`, `sheet_edges_visible`, `more_content_beyond`, `cut_off_edges`, `changes`, `confidence`, `done`, `ms` |
+| `assignment_updated` | state merged + saved | the full capture log + updated `assignment`, `edges_seen`, `open_edges`, `next_target` |
+| `done` | the sheet is covered and every problem read | `version`, problem count; `by: "operator"` when it came from `POST /complete` |
 | `job_finished` | job ended | `reason` (`done`/`max_captures`/`failed`/`stopped`), final `assignment` |
 | `capture_failed` | a pass failed (job keeps going) | `error` |
 | `capture_discarded` | `/reset` landed mid-capture | `reason` |
+| `done_rejected` | the model claimed `done` and the gate refused | `reason`, `edges_unseen`, `open_edges` |
 | `reset` | `/reset` called | new `version` |
 
 The stream sends `retry: 3000` (browsers reconnect on their own), a `: ping`
@@ -253,19 +301,24 @@ JPEG.
    (`max_age_ms=0` refuses the gateway's cached frame: a capture must see the
    paper as it is now.) With `SNAPSHOT_URL` unset it falls back to running
    `ffmpeg -frames:v 1` against RTSP itself.
-2. The frame plus the current transcription goes to Gemini with a
-   `responseSchema`, so the reply is schema-constrained JSON — no prose parsing.
-   If that call fails, **the next reader in the chain is tried** (below).
-3. The model returns the **complete updated** assignment; that replaces the
-   stored one, and the per-capture `changes` list is appended to history.
+2. The frame, the current transcription AND the coverage so far — which edges
+   of the sheet have been seen, which parts have been read, which problems are
+   still half-read — go to Gemini with a `responseSchema`, so the reply is
+   schema-constrained JSON and no prose is parsed. If that call fails, **the
+   next reader in the chain is tried** (below).
+3. The model returns the **complete updated** assignment; that is merged over
+   the stored one (a problem never goes backwards — see `mergeAssignment`), the
+   edges this frame saw are added to the running coverage set, and the
+   per-capture `changes` list is appended to history.
 4. `state.json` is written via temp-file + rename, so a crash mid-write can't
    corrupt it. `assignment.json` is written alongside as a clean copy.
 5. `/reset` archives to `data/archive/v<n>-<timestamp>.json` before clearing —
    flushing progress can't destroy a transcription you meant to keep.
 
 A photo published through `POST /photo` is the same thing as a capture from
-there on: same model call, same merge, same events, so nothing downstream has to
-know where the frame came from. It is written to `/frame.jpg` too — that route
+there on: same model call, same merge, same coverage accounting, same events, so
+nothing downstream has to know where the frame came from — and several photos of
+one sheet accumulate into one assignment exactly as several camera frames do. It is written to `/frame.jpg` too — that route
 means "the frame the last capture read", and after a photo, that is the photo.
 
 One capture runs at a time; a concurrent `POST /capture` gets `409` rather than
