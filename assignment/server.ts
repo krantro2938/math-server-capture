@@ -1893,8 +1893,14 @@ const server = Bun.serve({
 mkdirSync(cfg.dataDir, { recursive: true });
 saveState(); // make sure data/ is writable now, not on the first capture
 console.log(`assignment-reader on http://0.0.0.0:${server.port}`);
+// The whole chain, in order, because "which model is reading my paper" now has
+// up to four answers and the log is where you look first when one of them is
+// missing a key.
+const bootChain = buildChain();
 console.log(
-    `  model:  ${cfg.model}${cfg.modelFallback ? ` (fallback: ${cfg.modelFallback})` : ""}`,
+    bootChain.length
+        ? `  readers: ${bootChain.map((a) => `${a.provider}/${a.model}`).join("  →  ")}`
+        : `  readers: NONE — set GEMINI_API_KEY or MISTRAL_API_KEY, or every capture fails`,
 );
 console.log(
     `  frames: ${
