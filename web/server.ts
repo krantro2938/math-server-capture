@@ -177,15 +177,48 @@ async function playbackTimeline(from: Date, to: Date): Promise<Response> {
   });
 }
 
-async function playbackClip(start: string, duration: string): Promise<Response> {
+// THE SIZE OF THIS REQUEST IS THE ONLY THING BOUNDING THIS PROCESS'S MEMORY.
+// Read that before raising the cap.
+//
+// A proxied body is not streamed through Bun in the sense that matters here:
+// Bun drains the source as fast as MediaMTX will send it and buffers whatever
+// the client has not taken yet. A video player reads a recording at ~400 kB/s;
+// MediaMTX, on the same docker network reading off local disk, pushes it a
+// hundred times faster, and the difference lands in this heap.
+//
+// Measured on the VPS, one 300s clip against a client reading at 50 kB/s:
+//
+//   new Response(upstream.body)                        24MB -> 205MB
+//   ReadableStream, highWaterMark 1 (pull-gated)       38MB -> 358MB
+//   node:http source with socket pause()/resume()      47MB -> 397MB
+//
+// So it is not fetch() and it is not the source: the response writer is eager,
+// and no amount of backpressure upstream of it changes the outcome. The heap
+// cost is ~1.5x the bytes requested, whatever the client does.
+//
+// That is what killed the box on 2026-07-30. The History tab shipped asking for
+// hour-long clips — ~1.4GB of video — and the kernel OOM-killed this container
+// twice (anon-rss 1089612kB) on a 2GB host with no swap, taking every other
+// service down with it.
+//
+// The page therefore asks for ~60s at a time and stitches the chunks together
+// (double-buffered, so the joins are invisible). This cap exists for the URLs
+// the page does not control: a stale bookmark, a retry, someone curling by
+// hand. 90s is ~36MB of video, ~55MB of heap.
+const MAX_CLIP_S = 90;
+
+async function playbackClip(start: string, duration: string, signal: AbortSignal): Promise<Response> {
+  const secs = Math.min(Math.max(Number(duration) || 0, 1), MAX_CLIP_S);
   const qs = new URLSearchParams({
     path: CFG.streamPath,
     start,
-    duration,
+    duration: String(secs),
     format: "fmp4",
   });
   const url = `http://${CFG.mtxHost}:${CFG.playbackPort}/get?${qs}`;
-  const upstream = await fetch(url, { headers: { Authorization: mtxAuth } });
+  // The signal is what stops MediaMTX reading on for a viewer who has already
+  // seeked somewhere else — every seek abandons the request before it.
+  const upstream = await fetch(url, { headers: { Authorization: mtxAuth }, signal });
   const headers = new Headers(upstream.headers);
   headers.delete("www-authenticate");
   if (!headers.has("content-type")) headers.set("content-type", "video/mp4");
@@ -482,7 +515,7 @@ Bun.serve({
       const start = url.searchParams.get("start");
       const duration = url.searchParams.get("duration");
       if (!start || !duration) return new Response("bad request", { status: 400 });
-      return playbackClip(start, duration);
+      return playbackClip(start, duration, req.signal);
     }
 
     return new Response("not found", { status: 404 });

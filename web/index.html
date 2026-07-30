@@ -55,6 +55,9 @@
      picture and a timeline that is the seek bar. */
   .stage { position: relative; }
   .stage video { display: block; }
+  /* The spare player is stacked exactly under the active one and hidden — not
+     `display:none`, which would stop it decoding and defeat the preload. */
+  .stage video.spare { position: absolute; inset: 0; opacity: 0; pointer-events: none; }
   .stamp { position: absolute; left: 12px; top: 12px; padding: 5px 10px; border-radius: 8px;
            background: rgba(6,8,11,.72); border: 1px solid #23262d; backdrop-filter: blur(6px);
            font: 600 14px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -90,9 +93,19 @@
   .shots-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
   .shots-head h3 { font-size: 14px; margin: 0; font-weight: 600; }
   .strip { display: flex; gap: 10px; overflow-x: auto; padding: 2px 2px 8px; }
-  .shot { margin: 0; flex: none; width: 168px; cursor: pointer; border-radius: 9px;
+  .shot { position: relative; margin: 0; flex: none; width: 168px; cursor: pointer; border-radius: 9px;
           border: 1px solid #23262d; background: #14171c; overflow: hidden; transition: border-color .12s; }
   .shot:hover { border-color: #3b82f6; }
+  /* Download without opening the photo first. Hidden until the thumbnail is
+     hovered so the strip stays a strip of pictures — but always shown where
+     there is no hover to reveal it with (phones), or it would be unreachable. */
+  .shot .dl { position: absolute; top: 6px; right: 6px; opacity: 0; transition: opacity .12s;
+              padding: 2px 7px 3px; font-size: 13px; line-height: 1.25; border-radius: 6px;
+              background: rgba(10,12,15,.82); border: 1px solid #2b2f37; color: #e7e9ee;
+              cursor: pointer; backdrop-filter: blur(4px); }
+  .shot:hover .dl, .shot:focus-within .dl { opacity: 1; }
+  .shot .dl:hover { border-color: #3b82f6; color: #93c5fd; }
+  @media (hover: none) { .shot .dl { opacity: 1; } }
   .shot img { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; }
   .shot figcaption { padding: 5px 8px; font-size: 11.5px; color: #9aa1ad;
                      font-variant-numeric: tabular-nums; white-space: nowrap;
@@ -226,7 +239,13 @@
            to scrub. The timeline below IS the seek bar, and every seek off the
            buffer is a fresh request. `muted` because there is no audio track
            at all, and it makes autoplay unconditional. -->
+      <!-- TWO players, not one. Clips have to stay short (see MAX_CLIP_S in
+           server.ts — clip size is the only thing bounding the gateway's
+           memory), so the next chunk is loaded in the spare element while the
+           current one finishes and the two are swapped at the boundary. One
+           element would mean a visible stall every minute. -->
       <video id="player" playsinline muted></video>
+      <video id="player2" playsinline muted class="spare"></video>
       <div class="stamp" id="hist-stamp"><span class="day">—</span>--:--:--</div>
     </div>
     <div class="row">
@@ -359,7 +378,13 @@
 <script>
 const $ = (s) => document.querySelector(s);
 const liveVideo = $("#live");
-const player = $("#player");
+// The history players. `player` is whichever is ON SCREEN and is reassigned on
+// every hand-over, so everything below can keep saying `player` — but listeners
+// must be bound to BOTH elements, never to `player`, or they follow the element
+// rather than the role.
+const players = [$("#player"), $("#player2")];
+let player = players[0];
+const sparePlayer = () => (player === players[0] ? players[1] : players[0]);
 
 // ---------- tabs ----------
 let hls = null;
@@ -840,11 +865,16 @@ function fmtSpan(ms) {
 // How far back to ask for. A little more than the 24h retention, so the oldest
 // thing still on disk is always inside the window rather than at its edge.
 const HISTORY_HOURS = 30;
-// Ceiling on a single /api/clip. Nothing forces one — the browser suspends the
-// download once it is buffered far enough ahead — but a request that can run
-// for a day is a connection nothing ever closes. An hour means at worst one
-// reload per hour of continuous watching, and that reload is invisible.
-const MAX_CLIP_S = 3600;
+// How much video one /api/clip asks for. THIS IS A MEMORY BUDGET, not a
+// tuning knob: the gateway buffers whatever it requests (~1.5x the bytes — see
+// the note above MAX_CLIP_S in server.ts), and asking for an hour at a time is
+// what OOM-killed the VPS on 2026-07-30. 60s is ~24MB of video, ~36MB of heap
+// there, and two of those in flight during a hand-over.
+const CHUNK_S = 60;
+// Start fetching the next chunk this many seconds of PLAYBACK before the
+// current one runs out — so it scales with speed: at 8x, 8s of playback is 64s
+// of video, which is why the lead is measured in playback time, not media time.
+const PRELOAD_LEAD_S = 8;
 
 const TL = {
   ranges: [],        // [{s, e}] ms — where video exists, newest last
@@ -927,25 +957,94 @@ function seekTo(t, { force = false } = {}) {
   loadClip(t, r);
 }
 
+const clipUrl = (t, secs) =>
+  `/api/clip?start=${encodeURIComponent(new Date(t).toISOString())}&duration=${secs.toFixed(3)}`;
+
+// How long a chunk to ask for at `t`. The +5s slack matters only at the live
+// edge, where the newest range is still being written and the end we know about
+// is already stale; MediaMTX just stops early when it runs out, and onClipEnd
+// picks that up.
+const chunkFor = (t, r) => Math.min(CHUNK_S, Math.max(5, (r.e - t) / 1000 + 5));
+
 function loadClip(t, r) {
-  // +30s past the end we know about: the newest range is still being written,
-  // so asking slightly beyond it picks up whatever landed since the last
-  // refresh. MediaMTX just stops early when it runs out, which is handled.
-  const dur = Math.min(MAX_CLIP_S, Math.max(10, (r.e - t) / 1000 + 30));
+  cancelPreload();
+  const dur = chunkFor(t, r);
   clipStart = t;
   clipTo = t + dur * 1000;
   clipAt = Date.now();
   TL.playhead = t;
-  player.src = `/api/clip?start=${encodeURIComponent(new Date(t).toISOString())}&duration=${dur.toFixed(3)}`;
+  player.src = clipUrl(t, dur);
   player.load();
   player.play().catch(() => {});
   tlDraw();
 }
 
+// ---------- handing over between chunks ----------
+//
+// A chunk is a minute long because of the gateway's memory, but the recording
+// is supposed to look continuous. So the next one is fetched into the spare
+// player while this one plays out, and the two are swapped when it ends: no
+// request, no decode and no keyframe wait at the boundary, which is what a
+// single element would have to do every sixty seconds.
+let preload = null;   // { start, to, el }
+
+function cancelPreload() {
+  if (!preload) return;
+  const el = preload.el;
+  preload = null;
+  el.pause();
+  el.removeAttribute("src");
+  el.load();            // drops the buffer; without it the spare keeps it all
+}
+
+function maybePreloadNext() {
+  if (!histActive || preload || clipStart == null || clipTo == null) return;
+  const t = histTime();
+  if (t == null) return;
+  // Remaining PLAYBACK seconds, so 8x speed starts the fetch eight times earlier.
+  if ((clipTo - t) / 1000 / Math.max(0.1, histRate) > PRELOAD_LEAD_S) return;
+  const r = rangeAt(clipTo);
+  if (!r) return;                       // a gap follows; onClipEnd does the skip
+  const dur = chunkFor(clipTo, r);
+  if (dur < 2) return;
+  const el = sparePlayer();
+  preload = { start: clipTo, to: clipTo + dur * 1000, el };
+  el.src = clipUrl(clipTo, dur);
+  el.load();
+}
+
+function swapToPreloaded() {
+  const { el, start, to } = preload;
+  const old = player;
+  preload = null;
+  player = el;
+  el.classList.remove("spare");
+  old.classList.add("spare");
+  clipStart = start;
+  clipTo = to;
+  clipAt = Date.now();
+  el.playbackRate = histRate;
+  el.play().catch(() => {});
+  old.pause();
+  old.removeAttribute("src");
+  old.load();
+}
+
 // Playback rate does not survive a src change, so it is reapplied per clip
-// rather than set once — otherwise every gap crossing silently drops you to 1×.
+// rather than set once — otherwise every hand-over silently drops you to 1x.
 let histRate = 1;
-player.addEventListener("loadedmetadata", () => { player.playbackRate = histRate; });
+for (const v of players) {
+  v.addEventListener("loadedmetadata", () => { v.playbackRate = histRate; });
+  v.addEventListener("timeupdate", () => { if (v === player) maybePreloadNext(); });
+  v.addEventListener("ended", () => { if (v === player) onClipEnd(); });
+  // A 404 from the playback API means the recording was purged out from under
+  // us (or never existed at that instant). Same recovery as an empty clip.
+  v.addEventListener("error", () => {
+    if (v !== player || !histActive || clipStart == null) return;
+    if (Date.now() - clipAt > 30000) return;    // not ours; ignore late errors
+    onClipEnd(true);
+  });
+}
 
 /**
  * The end of a clip is never the end of the recording. Three cases, and telling
@@ -955,6 +1054,16 @@ player.addEventListener("loadedmetadata", () => { player.playbackRate = histRate
  */
 async function onClipEnd(failed = false) {
   if (!histActive || clipStart == null) return;
+
+  // The ordinary case: the next minute is already decoded in the spare player.
+  // Checked first and synchronously — anything awaited here is a visible gap.
+  if (!failed && preload && preload.el.readyState >= 2 &&
+      Math.abs(preload.start - clipTo) < 1500) {
+    swapToPreloaded();
+    return;
+  }
+  cancelPreload();
+
   const played = player.currentTime * 1000;
   const reached = clipStart + played;
   await refreshTimeline({ quiet: true });
@@ -986,14 +1095,6 @@ async function onClipEnd(failed = false) {
   setInfo(`Skipped ${fmtDur((after.s - reached) / 1000)} with no recording.`);
   seekTo(after.s, { force: true });
 }
-player.addEventListener("ended", onClipEnd);
-// A 404 from the playback API means the recording was purged out from under us
-// (or never existed at that instant). Same recovery as an empty clip.
-player.addEventListener("error", () => {
-  if (!histActive || clipStart == null) return;
-  if (Date.now() - clipAt > 30000) return;    // not ours; ignore late errors
-  onClipEnd(true);
-});
 
 // ---------- the clock over the picture ----------
 let stampRaf = 0, lastTick = 0;
@@ -1339,6 +1440,7 @@ async function enterHistory() {
 
 function leaveHistory() {
   histActive = false;
+  cancelPreload();
   player.pause();
   if (stampRaf) { cancelAnimationFrame(stampRaf); stampRaf = 0; }
   if (tlTimer) { clearInterval(tlTimer); tlTimer = null; }
@@ -1458,11 +1560,9 @@ async function captureFrame(source) {
     const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.92));
     if (!blob) throw new Error("the browser could not encode the frame");
 
-    // Download first, store second. If IndexedDB is unavailable (private
-    // window, storage denied) you still get the file — the gallery is the part
-    // that degrades, and it says so rather than swallowing the click.
-    downloadBlob(blob, shotName(at));
-
+    // Capture saves; it does not download. Grabbing ten frames while you look
+    // for the right one should not put ten files in Downloads — the strip below
+    // is where they land, and each thumbnail carries its own download button.
     const rec = { at, savedAt: Date.now(), source, w: c.width, h: c.height, blob };
     try {
       rec.thumb = await thumbOf(c, 336);
@@ -1470,9 +1570,12 @@ async function captureFrame(source) {
       await renderShots();
       setShotNote(source, "");
     } catch (e) {
+      // Nothing was kept, so offer the one copy that exists rather than losing
+      // the frame entirely.
       idbBroken = true;
+      downloadBlob(blob, shotName(at));
       renderShots();
-      setShotNote(source, "Downloaded, but this browser won't keep a gallery: " + (e.message || e));
+      setShotNote(source, "This browser won't keep a gallery, so it was downloaded instead: " + (e.message || e));
     }
   } catch (e) {
     setShotNote(source, "Capture failed: " + (e.message || e));
@@ -1529,7 +1632,15 @@ async function renderShots() {
     src.className = "src";
     src.textContent = dayOf(s.at) + (s.source === "live" ? " · live" : "");
     cap.appendChild(src);
-    fig.append(img, cap);
+    const dl = document.createElement("button");
+    dl.className = "dl";
+    dl.type = "button";
+    dl.textContent = "⤓";
+    dl.title = `Download ${shotName(s.at)}`;
+    dl.setAttribute("aria-label", dl.title);
+    // The figure opens the big view, so this must not reach it.
+    dl.addEventListener("click", (e) => { e.stopPropagation(); downloadBlob(s.blob, shotName(s.at)); });
+    fig.append(img, cap, dl);
     fig.addEventListener("click", () => openShot(i));
     strip.appendChild(fig);
   });

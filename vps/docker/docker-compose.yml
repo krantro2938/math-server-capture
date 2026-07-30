@@ -80,6 +80,18 @@ services:
     depends_on: [mediamtx]
     working_dir: /app
     command: bun run server.ts
+    # A ceiling, so a runaway here can never take the host with it. On
+    # 2026-07-30 the history DVR asked /api/clip for hour-long stretches, the
+    # proxy buffered ~1GB of video (Bun's response writer is eager — see
+    # MAX_CLIP_S in server.ts), and the kernel OOM-killer ran on a 2GB box with
+    # no swap: it killed this container twice and took every other service on
+    # the machine down with it. Inside a limit, only this dies, and
+    # `restart: unless-stopped` puts it straight back.
+    #
+    # Steady state is ~25MB; a clip hand-over peaks near 80MB; /api/snapshot.jpg
+    # forks an ffmpeg that decodes 1080p in this same cgroup. 512m is roomy for
+    # all three at once and still a quarter of the box.
+    mem_limit: 512m
     volumes:
       - ../../web:/app:ro          # edit the SPA without rebuilding
     ports:

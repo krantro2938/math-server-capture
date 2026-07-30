@@ -141,19 +141,42 @@ asks for a stretch that spans one). Its timestamps are also microsecond-precise
 while `Date.parse` truncates to milliseconds, which is why `/api/timeline`
 rounds range boundaries *inward* — a start rounded down by 0.4ms is a 404.
 
+#### Why playback is chopped into minutes
+
+**`/api/clip` size is the gateway's memory budget.** Bun's response writer is
+eager: it drains the proxied body as fast as MediaMTX will send it and buffers
+whatever the client has not taken, so a request costs ~1.5x its bytes in RSS no
+matter how slowly the player reads. Measured against a 50 kB/s client, a 300s
+clip took the container from 24MB to 205MB — and neither a pull-gated
+`ReadableStream` (358MB) nor a `node:http` source with `pause()`/`resume()`
+(397MB) changed it, because the buffering is downstream of both.
+
+The first version of this tab asked for an hour at a time. On 2026-07-30 that
+grew the container to ~1GB twice and the kernel OOM-killer took the whole 2GB
+host down with it. So the page now asks for **60s at a time** and pre-loads the
+next chunk into a second `<video>` while the current one plays, swapping at the
+boundary — measured over 150s of playback: 2 hand-overs, no stalls, no dropped
+frames, wall clock and media clock in lockstep. `MAX_CLIP_S` in `server.ts`
+caps anything that asks for more, and `mem_limit: 512m` on the `web` service
+means a future mistake here kills one container instead of the machine.
+
 ### Capture frame
 
 Both players have a **📷 Capture frame** button. It grabs the frame you are
 actually looking at (a canvas draw off the `<video>` — not `/api/snapshot.jpg`,
 which opens its own RTSP session and would return a different moment, or
-nothing at all while you are scrubbed back), downloads it as
-`cam-YYYY-MM-DD_HH-MM-SS.jpg`, and keeps it in a strip under the player. The
-timestamp is the frame's, not the click's: live uses the HLS
+nothing at all while you are scrubbed back) and keeps it in a strip under the
+player. The timestamp is the frame's, not the click's: live uses the HLS
 `EXT-X-PROGRAM-DATE-TIME`, history uses the scrubber position.
+
+Capture **saves; it does not download** — grabbing ten frames while you look for
+the right one should not put ten files in Downloads. Each thumbnail carries its
+own **⤓** button (on hover, and always on touch) that saves that one as
+`cam-YYYY-MM-DD_HH-MM-SS.jpg`.
 
 Saved photos live in **IndexedDB in that browser** — they are per-device and
 per-browser, survive reloads, and never reach the VPS. Click one to open it
-full size (arrow keys to move, `Esc` to close), where it can be downloaded again
+full size (arrow keys to move, `Esc` to close), where it can also be downloaded
 or deleted; `Clear all` empties the store.
 
 ## Running unattended
