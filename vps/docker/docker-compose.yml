@@ -139,6 +139,13 @@ services:
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
       # Second attempt, only when the primary 404s / rate-limits / 5xx's.
       GEMINI_MODEL_FALLBACK: ${GEMINI_MODEL_FALLBACK:-gemini-3.1-flash-lite}
+      # The backup PROVIDER, tried only after BOTH Gemini models have failed. A
+      # second Google model is no help against an outage at Google, a revoked key
+      # or a region-wide 429 — which are the failures that leave a camera reading
+      # nothing at all. Unset the key and the reader behaves as it did before.
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      MISTRAL_MODEL: ${MISTRAL_MODEL:-mistral-medium-latest}
+      MISTRAL_MODEL_FALLBACK: ${MISTRAL_MODEL_FALLBACK:-mistral-small-2506}
       API_TOKEN: ${ASSIGNMENT_TOKEN:?set ASSIGNMENT_TOKEN in .env}
       # Settle time AFTER the model answers, before the next frame is grabbed —
       # the loop is sequential, so this is not a fixed capture cadence.

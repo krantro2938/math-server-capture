@@ -183,12 +183,52 @@ bun --env-file=.env run server.ts
 
 Needs `ffmpeg` on PATH (the Docker image installs it).
 
+## Four readers, tried in order
+
+```
+gemini-3.5-flash-lite  →  gemini-3.1-flash-lite  →  mistral-medium-latest  →  mistral-small-2506
+└──────────── GEMINI_API_KEY ────────────┘        └────────── MISTRAL_API_KEY ──────────┘
+```
+
+A capture costs one API call **per rung reached**, and a rung is only ever reached
+because the one before it genuinely failed — never a routine double-spend. Which
+one answered is reported: `model_response` carries `provider` and `model`, each
+`captures[]` entry in `/state` records them, and a `model_fallback` event fires
+for every rung that failed.
+
+Why a second *provider* and not just a second Google model: a second Gemini model
+does nothing about an outage at Google, a revoked key or a region-wide 429 — and
+those are exactly the failures that leave a camera pointed at a sheet of paper
+transcribing nothing at all.
+
+**How far a failure skips.** Inside one provider only a recoverable failure
+(404 / 429 / 5xx, or unusable output) earns another call: a 400 means this code
+built a request that provider rejects, and its sibling model would reject it
+identically. But that is not a reason to *stop* — an invalid Google key is a
+`400 API key not valid`, not a 401 — so anything unrecoverable here skips the rest
+of this provider's models and tries the other one, whose endpoint, key and schema
+dialect are all different. One exception, because the two APIs disagree: a model
+id nobody knows is a **404 at Google and a 400 at Mistral**, so Mistral's error
+body is checked for `invalid_model` and treated as recoverable. A renamed id is
+the most likely way this chain ever breaks, and it must not take the sibling down
+with it.
+
+Mistral gets the same prompt and the same schema (as strict `json_schema`, which
+additionally forbids unknown keys), and its reply is shape-checked before it is
+merged — "enforced" is a claim by the thing being checked. It cannot read HEIC,
+so `POST /photo` from an iPhone gallery is Gemini's job; a camera frame is always
+JPEG.
+
 ## Configuration
 
 | Var | Default | Notes |
 |---|---|---|
 | `GEMINI_API_KEY` | — | required |
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | **Unverified id.** If Google answers `404 model not found`, change this — nothing else depends on it. Known-good: `gemini-2.5-flash-lite`, `gemini-2.5-flash`. |
+| `GEMINI_MODEL_FALLBACK` | `gemini-3.1-flash-lite` | second Gemini attempt, only when the first fails recoverably |
+| `MISTRAL_API_KEY` | — | enables the **backup provider**. Empty and the reader is Gemini-only, exactly as before |
+| `MISTRAL_MODEL` | `mistral-medium-latest` | third attempt overall |
+| `MISTRAL_MODEL_FALLBACK` | `mistral-small-2506` | fourth and last |
 | `SNAPSHOT_URL` | — | **preferred frame source**: the gateway's `/api/snapshot.jpg` |
 | `SNAPSHOT_TOKEN` | — | must match `SNAPSHOT_TOKEN` on the gateway |
 | `RTSP_URL` | `rtsp://viewer:…@mediamtx:8554/cam1` | fallback source, used only when `SNAPSHOT_URL` is empty (needs ffmpeg here) |
@@ -215,6 +255,7 @@ Needs `ffmpeg` on PATH (the Docker image installs it).
    `ffmpeg -frames:v 1` against RTSP itself.
 2. The frame plus the current transcription goes to Gemini with a
    `responseSchema`, so the reply is schema-constrained JSON — no prose parsing.
+   If that call fails, **the next reader in the chain is tried** (below).
 3. The model returns the **complete updated** assignment; that replaces the
    stored one, and the per-capture `changes` list is appended to history.
 4. `state.json` is written via temp-file + rename, so a crash mid-write can't

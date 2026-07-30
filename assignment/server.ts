@@ -59,6 +59,17 @@ const cfg = {
         process.env.GEMINI_BASE_URL ??
         "https://generativelanguage.googleapis.com",
 
+    // Mistral: the backup PROVIDER, tried only after both Gemini models have
+    // failed. A second Google model does nothing for an outage at Google, a
+    // revoked key or a region-wide 429 — those are exactly the failures that
+    // leave a camera pointed at a sheet of paper reading nothing at all. Empty
+    // key disables it, and the reader behaves as it did before.
+    mistralKey: process.env.MISTRAL_API_KEY ?? "",
+    mistralModel: process.env.MISTRAL_MODEL ?? "mistral-medium-latest",
+    mistralModelFallback:
+        process.env.MISTRAL_MODEL_FALLBACK ?? "mistral-small-2506",
+    mistralBase: process.env.MISTRAL_BASE_URL ?? "https://api.mistral.ai",
+
     // Where frames come from. Preferred: ask the web gateway, which owns stream
     // access and MediaMTX's credentials — then this service needs nothing but
     // HTTP and can run anywhere, including off the VPS.
@@ -101,6 +112,13 @@ type Assignment = {
 type CaptureLog = {
     n: number;
     at: string;
+    /**
+     * Who read this frame. Optional because a state.json written before the
+     * provider chain existed has neither, and every reader of this type has to
+     * cope with the file already on disk.
+     */
+    provider?: string;
+    model?: string;
     frame_quality: string;
     full_page_visible: boolean;
     camera_advice: string;
@@ -467,44 +485,119 @@ type GeminiResult = {
     done: boolean;
 };
 
-/** Whether trying the fallback model can plausibly help. A rejected id, a
- *  rate-limited model or a transient Google failure are all worth a second
- *  attempt on the other model; a malformed request (400) or a bad key/permission
- *  (401/403) would fail identically there, so those propagate as-is. */
+/** Whether trying the next model can plausibly help. A rejected id, a
+ *  rate-limited model or a transient upstream failure are all worth another
+ *  attempt; a malformed request (400) would fail identically on a sibling model,
+ *  so it only earns a retry once the chain crosses to a different PROVIDER —
+ *  see stepIsWorthIt. A bad key (401/403) is worth crossing providers too, since
+ *  the other one's key is a different secret entirely. */
 function worthFallback(status: number): boolean {
     return status === 404 || status === 429 || status >= 500;
 }
 
+/** One rung of the chain: which provider, which model there. */
+type Attempt = { provider: "gemini" | "mistral"; model: string };
+
+/**
+ * Gemini first, both of its models, then Mistral's two.
+ *
+ * Order is the point. Gemini is the primary because the prompt and the schema
+ * were written against it and it is what every capture so far has been read by;
+ * Mistral exists for the failures a second Gemini model cannot survive. A rung
+ * with no key or no model id is dropped rather than attempted, so a deployment
+ * that never sets MISTRAL_API_KEY has exactly the behaviour it had before.
+ */
+function buildChain(): Attempt[] {
+    const chain: Attempt[] = [];
+    if (cfg.geminiKey) {
+        if (cfg.model) chain.push({ provider: "gemini", model: cfg.model });
+        if (cfg.modelFallback)
+            chain.push({ provider: "gemini", model: cfg.modelFallback });
+    }
+    if (cfg.mistralKey) {
+        if (cfg.mistralModel)
+            chain.push({ provider: "mistral", model: cfg.mistralModel });
+        if (cfg.mistralModelFallback)
+            chain.push({ provider: "mistral", model: cfg.mistralModelFallback });
+    }
+    return chain;
+}
+
+/**
+ * Which rung to try after `chain[i]` failed with `err`, or -1 to give up.
+ *
+ * Within a provider only a retryable failure earns another call: a 400 means
+ * this code built a request that provider rejects, and its sibling model would
+ * reject it identically — spending a second call to learn that is just money.
+ *
+ * But it is NOT a reason to stop, and that distinction is the whole point of
+ * having a second provider. An invalid key is a 400 from Google ("API key not
+ * valid"), not a 401; so is a request shape one API dislikes and the other is
+ * fine with. Those must skip past the rest of this provider's models and try the
+ * other one, whose endpoint, key and schema dialect are all different. Anything
+ * genuinely unrecoverable — a bad image both providers refuse — simply fails
+ * again over there, once, and the capture fails with the last error.
+ */
+function nextRung(err: any, chain: Attempt[], i: number): number {
+    if (err?.fallbackWorthwhile && i + 1 < chain.length) return i + 1;
+    const provider = chain[i].provider;
+    for (let k = i + 1; k < chain.length; k++) {
+        if (chain[k].provider !== provider) return k;
+    }
+    return -1;
+}
+
 /** Primary model, then GEMINI_MODEL_FALLBACK if the primary fails in a way the
- *  other model might survive. A capture costs one API call, so the fallback is
- *  only ever a second call when the first genuinely failed — never a routine
- *  double-spend. */
+ *  other model might survive, then Mistral. A capture costs one API call per
+ *  rung, so a later rung is only ever reached when the one before it genuinely
+ *  failed — never a routine double-spend.
+ *
+ *  Returns WHICH rung answered along with the reading: with four possible
+ *  readers, "what did the model say" is not a complete answer to what happened
+ *  during a capture, and the fallbacks are silent by nature — the picture still
+ *  gets transcribed, so without this the only trace of Google being down is a
+ *  line in the log nobody is watching. */
 async function readFrame(
     jpeg: Buffer,
     note: string,
     mime = "image/jpeg",
-): Promise<GeminiResult> {
-    if (!cfg.geminiKey) throw new Error("GEMINI_API_KEY is not set");
-    const chain = cfg.modelFallback
-        ? [cfg.model, cfg.modelFallback]
-        : [cfg.model];
+): Promise<{ result: GeminiResult; used: Attempt }> {
+    const chain = buildChain();
+    if (!chain.length) {
+        throw new Error("no reader configured: set GEMINI_API_KEY or MISTRAL_API_KEY");
+    }
 
     let lastErr: any;
-    for (let i = 0; i < chain.length; i++) {
+    let attempts = 0;
+    for (let i = 0; i >= 0 && i < chain.length; ) {
+        const rung = chain[i];
+        attempts++;
         try {
-            return await callGemini(chain[i], jpeg, note, mime);
+            const result =
+                rung.provider === "gemini"
+                    ? await callGemini(rung.model, jpeg, note, mime)
+                    : await callMistral(rung.model, jpeg, note, mime);
+            if (attempts > 1) {
+                console.warn(
+                    `[read] ${rung.provider}/${rung.model} answered after ${attempts - 1} failed attempt(s)`,
+                );
+            }
+            return { result, used: rung };
         } catch (e: any) {
             lastErr = e;
-            const next = chain[i + 1];
-            if (!next || !e?.fallbackWorthwhile) throw e;
+            const next = nextRung(e, chain, i);
+            if (next < 0) throw e;
             console.warn(
-                `[gemini] ${chain[i]} failed (${e.message?.slice(0, 160)}) — retrying on ${next}`,
+                `[read] ${rung.provider}/${rung.model} failed (${e.message?.slice(0, 160)}) — retrying on ${chain[next].provider}/${chain[next].model}`,
             );
             emit("model_fallback", {
-                from: chain[i],
-                to: next,
+                from: rung.model,
+                from_provider: rung.provider,
+                to: chain[next].model,
+                to_provider: chain[next].provider,
                 reason: String(e?.message ?? e).slice(0, 300),
             });
+            i = next;
         }
     }
     throw lastErr;
@@ -587,6 +680,139 @@ async function callGemini(
             { fallbackWorthwhile: true },
         );
     }
+}
+
+/**
+ * The same schema, in the dialect Mistral's strict mode wants.
+ *
+ * Gemini's `responseSchema` and OpenAI-style `json_schema` are both JSON Schema
+ * as far as this schema uses it, with one difference that matters: strict mode
+ * refuses an object that doesn't forbid extra keys. Adding that here — rather
+ * than to RESPONSE_SCHEMA itself — keeps ONE schema as the source of truth, so
+ * a field added for Gemini cannot silently fail to reach Mistral.
+ */
+function strictJsonSchema(node: any): any {
+    if (Array.isArray(node)) return node.map(strictJsonSchema);
+    if (!node || typeof node !== "object") return node;
+    const out: any = {};
+    for (const [k, v] of Object.entries(node)) out[k] = strictJsonSchema(v);
+    if (out.type === "object") out.additionalProperties = false;
+    return out;
+}
+
+/**
+ * Read the frame with Mistral. Same contract as callGemini — same prompt, same
+ * schema, same GeminiResult back — so everything downstream is unaware of which
+ * one answered.
+ *
+ * Note this cannot read HEIC: Mistral takes jpeg/png/webp/gif, and Gemini is
+ * what makes `POST /photo` from an iPhone gallery work. A camera frame is always
+ * JPEG, so the chain is intact for captures; a HEIC upload that gets this far has
+ * already had both Gemini models fail, and fails here too rather than silently
+ * transcribing nothing.
+ */
+async function callMistral(
+    model: string,
+    jpeg: Buffer,
+    note: string,
+    mime = "image/jpeg",
+): Promise<GeminiResult> {
+    const res = await fetch(`${cfg.mistralBase}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${cfg.mistralKey}`,
+        },
+        body: JSON.stringify({
+            model,
+            temperature: 0, // transcription, not creativity
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        {
+                            type: "image_url",
+                            image_url: {
+                                url: `data:${mime};base64,${jpeg.toString("base64")}`,
+                            },
+                        },
+                        { type: "text", text: buildPrompt(note) },
+                    ],
+                },
+            ],
+            response_format: {
+                type: "json_schema",
+                json_schema: {
+                    name: "assignment_reading",
+                    strict: true,
+                    schema: strictJsonSchema(RESPONSE_SCHEMA),
+                },
+            },
+        }),
+    });
+
+    const raw = await res.text();
+    if (!res.ok) {
+        // A model id Mistral doesn't know is a 400 here, where the same mistake
+        // is a 404 at Google — so status alone would have this skip its own
+        // sibling on exactly the failure the sibling exists for. Both API ids in
+        // this file are configurable and one of them being renamed upstream is
+        // the single most likely way this chain ever breaks, so the id is read
+        // out of the body rather than inferred from the code.
+        const rejectedId = /invalid[_ ]model|model.{0,20}not found/i.test(raw);
+        throw Object.assign(
+            new Error(
+                `Mistral ${res.status} (model="${model}"): ${raw.slice(0, 800)}`,
+            ),
+            { fallbackWorthwhile: worthFallback(res.status) || rejectedId },
+        );
+    }
+    let body: any;
+    try {
+        body = JSON.parse(raw);
+    } catch {
+        throw new Error(`Mistral returned non-JSON: ${raw.slice(0, 400)}`);
+    }
+    const text = body?.choices?.[0]?.message?.content;
+    if (!text)
+        throw Object.assign(
+            new Error(
+                `Mistral returned no content (model="${model}"): ${raw.slice(0, 400)}`,
+            ),
+            { fallbackWorthwhile: true },
+        );
+    let parsed: any;
+    try {
+        parsed = typeof text === "string" ? JSON.parse(text) : text;
+    } catch {
+        throw Object.assign(
+            new Error(
+                `model output was not valid JSON (model="${model}"): ${String(text).slice(0, 400)}`,
+            ),
+            { fallbackWorthwhile: true },
+        );
+    }
+
+    // Gemini's responseSchema is enforced by Google; strict json_schema is
+    // enforced by Mistral — but "enforced" is a claim by the thing being
+    // checked, and a reply missing `framing` would crash the merge rather than
+    // fail the capture. One shape check, then the fallback can have a go.
+    if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        !parsed.framing ||
+        typeof parsed.framing !== "object" ||
+        !parsed.assignment ||
+        !Array.isArray(parsed.assignment.problems)
+    ) {
+        throw Object.assign(
+            new Error(
+                `Mistral output did not match the schema (model="${model}"): ${JSON.stringify(parsed).slice(0, 400)}`,
+            ),
+            { fallbackWorthwhile: true },
+        );
+    }
+    return parsed as GeminiResult;
 }
 
 // ------------------------------------------------------------------ sse -----
@@ -841,13 +1067,21 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             source: supplied ? "upload" : cfg.snapshotUrl ? "gateway" : "rtsp",
         });
 
-        // The model actually used may end up being the fallback — a
-        // model_fallback event follows if it does.
-        emit("model_request", { model: cfg.model });
+        // The reader actually used may end up being a fallback — a
+        // model_fallback event follows for each rung that failed, and
+        // model_response names the one that answered.
+        const chain = buildChain();
+        emit("model_request", {
+            model: chain[0]?.model ?? "",
+            provider: chain[0]?.provider ?? "",
+            chain: chain.map((a) => `${a.provider}/${a.model}`),
+        });
         const modelStart = Date.now();
-        const result = await readFrame(jpeg, note, mime);
+        const { result, used } = await readFrame(jpeg, note, mime);
         emit("model_response", {
             ms: Date.now() - modelStart,
+            provider: used.provider,
+            model: used.model,
             frame_quality: result.frame_quality,
             camera_advice: result.framing.camera_advice,
             advice_detail: result.framing.advice_detail,
@@ -923,6 +1157,8 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
         const log: CaptureLog = {
             n: state.capture_count,
             at: new Date().toISOString(),
+            provider: used.provider,
+            model: used.model,
             frame_quality: result.frame_quality,
             full_page_visible: result.framing.full_page_visible,
             camera_advice: result.framing.camera_advice,
