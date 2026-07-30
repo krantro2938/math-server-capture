@@ -98,11 +98,63 @@ bash ~/lookcam/phone/setup-termux.sh   # deps + config + Termux:Boot autostart
 nano ~/lookcam/run/config.local.env    # VPS_HOST, PUBLISH_PASS, CAM_UID; MODE="copy"
 bash ~/lookcam/phone/termux-run.sh     # runs forever; log: ~/lookcam.log
 ```
+Note that after `setup-termux.sh` the supervisor **already starts itself on every
+boot**, headless — Termux:Boot runs it with no session attached, so it is invisible
+in the Termux UI even while it is streaming. Starting a second one by hand does
+not double anything up; it makes both flap (see
+[One at a time](#one-at-a-time)). `termux-run.sh` refuses to start in that case,
+and `--force` takes over instead.
+
 See [Running unattended](#running-unattended) for what retries what.
 
-Then open the web page → **Live** tab (HLS) and **Recordings** tab (day timeline,
-click to play, auto-advance). Recordings are 15-min fMP4 segments in
-`/opt/mediamtx/recordings/cam1/` — parse them however you like.
+Then open the web page → **Live** tab (HLS) and **History** tab (see below).
+Recordings are 15-min fMP4 segments in `/opt/mediamtx/recordings/cam1/` — parse
+them however you like.
+
+## The web UI
+
+### History — one continuous recording
+
+The History tab does not show files. MediaMTX's playback `/list` already
+concatenates contiguous segments into unbroken **timespans**, so the page treats
+the whole retention window as a single recording with holes in it: a scrubber
+drawn in wall-clock time, a clock burned over the picture, and playback that
+crosses file boundaries and gaps on its own.
+
+- **Click** the timeline to jump to that instant, **drag** to pan, **scroll**
+  (or pinch) to zoom from ~20 seconds to the full day. `All` fits everything
+  kept; `⏭ Newest` jumps to the live edge; the date/time box goes to an exact
+  moment.
+- Blue is recorded, black is not, the amber dashed line is now. A run of thin
+  bars means the stream was flapping then — usually two capture pipelines
+  fighting (see [One at a time](#one-at-a-time)).
+- Gaps are crossed automatically and named ("Skipped 3s with no recording"),
+  so leaving it playing walks forward through the day.
+- `−1m / −10s / +10s / +1m` seek inside the buffer when they can (instant) and
+  re-request when they can't; speed goes to 8× for scanning.
+
+Two properties of MediaMTX playback shape all of that, and are worth knowing
+before changing it: `/get` is a progressive stream with `accept-ranges: none`
+(so every seek off the buffer is a new request — the native seek bar is hidden
+because it could not work), and it **stops dead at a gap** (so the page never
+asks for a stretch that spans one). Its timestamps are also microsecond-precise
+while `Date.parse` truncates to milliseconds, which is why `/api/timeline`
+rounds range boundaries *inward* — a start rounded down by 0.4ms is a 404.
+
+### Capture frame
+
+Both players have a **📷 Capture frame** button. It grabs the frame you are
+actually looking at (a canvas draw off the `<video>` — not `/api/snapshot.jpg`,
+which opens its own RTSP session and would return a different moment, or
+nothing at all while you are scrubbed back), downloads it as
+`cam-YYYY-MM-DD_HH-MM-SS.jpg`, and keeps it in a strip under the player. The
+timestamp is the frame's, not the click's: live uses the HLS
+`EXT-X-PROGRAM-DATE-TIME`, history uses the scrubber position.
+
+Saved photos live in **IndexedDB in that browser** — they are per-device and
+per-browser, survive reloads, and never reach the VPS. Click one to open it
+full size (arrow keys to move, `Esc` to close), where it can be downloaded again
+or deleted; `Clear all` empties the store.
 
 ## Running unattended
 
@@ -118,6 +170,40 @@ alone. Four nested layers, each restarting the one inside it:
 
 So: power-cycling the camera, roaming it to another hotspot, losing WiFi, or
 rebooting the phone all recover on their own with no interaction.
+
+### One at a time
+
+Every layer above restarts things, so the one failure they cannot fix between
+them is *too many* of them. Two capture pipelines do not share the load, they
+fight: both log into the camera (which then reports `connectNum: 2`), and both
+SRT-publish to the same MediaMTX path — where `overridePublisher` defaults to
+`yes`, so each new publisher kicks the other off. Every few seconds one of them
+dies with `Error submitting a packet to the muxer: I/O error` and a broken pipe,
+restarts, and kicks the other. The site keeps showing video the whole time,
+hitching, which is why this can run for hours before anyone calls it a fault.
+
+The usual way in is invisible: Android kills the *supervisor* (the idlest process
+in the tree) but leaves `capture.sh` running, re-parented to init. It has its own
+retry loop, so the stream carries on with nothing supervising it, no session in
+the Termux UI, and no obvious sign the phone is streaming at all — until you
+start a second supervisor by hand and the two start fighting.
+
+So `termux-run.sh` looks for a live pipeline (`capture.sh`, `lookcam_stream.py`,
+or an ffmpeg holding `streamid=publish:`) as well as for another supervisor, and
+refuses to start alongside one:
+
+```bash
+bash phone/termux-run.sh            # refuses (exit 3) and names what is running
+bash phone/termux-run.sh --force    # stops that, orphans included, then takes over
+pgrep -af 'termux-run|capture.sh|lookcam_stream|ffmpeg'   # see it yourself
+```
+
+A related trap worth knowing: `termux-wake-lock`/`unlock` are **app-wide**, not
+per-process. A second instance that took the wake lock on the way in and released
+it on exit would leave the *surviving* supervisor unprotected, and Android would
+suspend it the next time the screen went off — a stream that dies minutes after
+you put the phone down, with nothing in the log. The guard runs before the wake
+lock is ever touched, which is what keeps that from happening.
 
 On the **VPS**, `restart: unless-stopped` covers crashes, OOM kills and reboots
 (with `systemctl enable docker`); `transcode.sh` also retries internally, so it
@@ -155,7 +241,7 @@ remains as a last resort for when the AP interface is missing from `ip addr`.
 | `vps/mediamtx.yml` | MediaMTX: ingest + record + playback, with auth |
 | `vps/transcode.sh` · `vps/install-transcode.sh` | VPS HEVC→H.264 transcode (only for `MODE=copy`) + its systemd unit |
 | `vps/setup-web.sh` | Install the web gateway + Caddy HTTPS |
-| `web/server.ts` · `web/index.html` | Bun gateway + SPA: password login, live + DVR, `GET /api/snapshot.jpg` (one still frame) |
+| `web/server.ts` · `web/index.html` | Bun gateway + SPA: password login, live + [continuous-history DVR](#history--one-continuous-recording), [frame capture](#capture-frame), `GET /api/snapshot.jpg` (one still frame) |
 | `assignment/` | Reads an assignment off the paper via Gemini — one `POST /start`, SSE progress, LaTeX output |
 | `client.py` · `run_aiopppp.py` · `probe_cmds.py` · `pcap_*.py` | RE tools used to crack the protocol (kept for reference) |
 

@@ -3,7 +3,8 @@
 // One public port. Serves the SPA, handles a shared-password login, and proxies
 // to MediaMTX (which stays bound to localhost) injecting the viewer credentials:
 //   - live:        HLS  ->  http://MTX:8888/<path>/*
-//   - recordings:  playback /list + /get on http://MTX:9996
+//   - history:     playback /list + /get on http://MTX:9996 — /api/timeline is
+//                  "when does video exist", /api/clip is "give me that stretch"
 //   - snapshot:    GET /api/snapshot.jpg -> one JPEG off the live stream, so
 //                  anything that wants a still (the assignment reader, a
 //                  dashboard, a cron job) asks HTTP instead of speaking RTSP
@@ -94,26 +95,86 @@ async function proxyHls(rest: string): Promise<Response> {
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
-async function playbackList(date: string): Promise<Response> {
-  // date = YYYY-MM-DD -> list that whole local day.
-  const start = new Date(`${date}T00:00:00`);
-  const end = new Date(start.getTime() + 24 * 3600 * 1000);
+// ---- the history timeline --------------------------------------------------
+//
+// What the page needs is not a file listing but "when does video exist" — the
+// answer it draws a DVR scrubber from. MediaMTX's /list is already that shape:
+// it concatenates contiguous segment FILES into one entry each, so a run of
+// eight 15-minute files that never dropped comes back as a single two-hour
+// timespan, and a new entry only starts where the publisher actually broke.
+//
+// So this is a normaliser, not a builder. Two things are worth doing here
+// rather than in the browser:
+//
+//   - Overlaps are real. When two capture pipelines fight over the same path
+//     (see "One at a time" in the README) MediaMTX records both, and /list
+//     hands back timespans that genuinely overlap — negative gaps. Drawn
+//     unmerged those stack into a barcode; merged, they are one range.
+//   - Everything else is left EXACTLY as MediaMTX reported it. Merging two
+//     spans across a real hole would be a lie the player then has to live
+//     with: /get stops dead at a gap, so a clip requested across one ends
+//     early and the page would re-request the same spot forever. The rule is
+//     "never ask for a stretch MediaMTX won't serve in one piece".
+async function playbackTimeline(from: Date, to: Date): Promise<Response> {
   const qs = new URLSearchParams({
     path: CFG.streamPath,
-    start: start.toISOString(),
-    end: end.toISOString(),
+    start: from.toISOString(),
+    end: to.toISOString(),
   });
   const url = `http://${CFG.mtxHost}:${CFG.playbackPort}/list?${qs}`;
-  const upstream = await fetch(url, { headers: { Authorization: mtxAuth } });
-  if (!upstream.ok) return new Response("[]", { status: 200, headers: json });
-  const segs = (await upstream.json()) as Array<{ start: string; duration: number }>;
-  // Rewrite to point at our own /api/clip so creds stay server-side.
-  const rewritten = segs.map((s) => ({
-    start: s.start,
-    duration: s.duration,
-    url: `/api/clip?start=${encodeURIComponent(s.start)}&duration=${s.duration}`,
-  }));
-  return new Response(JSON.stringify(rewritten), { headers: json });
+
+  let raw: Array<{ start: string; duration: number }> = [];
+  try {
+    const upstream = await fetch(url, { headers: { Authorization: mtxAuth } });
+    // A path that has never recorded 404s here. That is "nothing yet", not an
+    // error worth showing — the page says "no recordings" either way.
+    if (upstream.ok) raw = (await upstream.json()) as typeof raw;
+  } catch { /* MediaMTX down: same empty answer, and the live tab will say so */ }
+
+  // MediaMTX stamps these with MICROSECOND precision and Date.parse keeps only
+  // milliseconds — truncating, so a parsed start is up to 1ms EARLIER than the
+  // real one. That is not a rounding curiosity: playback /get 404s on an
+  // instant that predates every segment, so a start reported as
+  // 09:59:52.497 (really .49736) is a range whose first frame cannot be
+  // fetched. Measured: .497 -> 404, .498 -> 200. Boundaries are rounded INWARD —
+  // starts up, ends down — and a range then only ever names instants MediaMTX
+  // will actually serve.
+  const subMs = (iso: string) => {
+    const m = /\.(\d+)/.exec(iso);
+    return !!m && m[1].length > 3 && /[1-9]/.test(m[1].slice(3));
+  };
+  const spans = raw
+    .map((s) => {
+      const t = Date.parse(s.start);
+      return { s: t + (subMs(s.start) ? 1 : 0), e: t + Math.floor(s.duration * 1000) };
+    })
+    .filter((r) => Number.isFinite(r.s) && r.e > r.s)
+    .sort((a, b) => a.s - b.s);
+
+  const ranges: Array<{ start: string; end: string; duration: number }> = [];
+  let cur: { s: number; e: number } | null = null;
+  const flush = () => {
+    if (cur) ranges.push({
+      start: new Date(cur.s).toISOString(),
+      end: new Date(cur.e).toISOString(),
+      duration: (cur.e - cur.s) / 1000,
+    });
+  };
+  for (const r of spans) {
+    if (cur && r.s <= cur.e) cur.e = Math.max(cur.e, r.e);   // overlap only
+    else { flush(); cur = { ...r }; }
+  }
+  flush();
+
+  // `now` is the server's clock, and the page anchors the live edge of the
+  // scrubber to it. Sending it means a browser whose clock is minutes out
+  // draws the timeline in the right place anyway.
+  return Response.json({
+    now: new Date().toISOString(),
+    from: from.toISOString(),
+    to: to.toISOString(),
+    ranges,
+  });
 }
 
 async function playbackClip(start: string, duration: string): Promise<Response> {
@@ -283,9 +344,22 @@ Bun.serve({
 
     if (path.startsWith("/live/")) return proxyHls(path.slice("/live/".length) + url.search);
 
-    if (path === "/api/recordings") {
-      const date = url.searchParams.get("date") ?? new Date().toISOString().slice(0, 10);
-      return playbackList(date);
+    // When video exists, as ranges. ?from/&to are ISO instants; the default
+    // window is the whole retention period plus a little, so the scrubber can
+    // show everything there is in one go.
+    if (path === "/api/timeline") {
+      const now = Date.now();
+      const parse = (v: string | null, fallback: number) => {
+        const t = v ? Date.parse(v) : NaN;
+        return Number.isFinite(t) ? t : fallback;
+      };
+      const to = parse(url.searchParams.get("to"), now + 60_000);
+      const from = Math.max(
+        parse(url.searchParams.get("from"), now - 30 * 3600 * 1000),
+        to - 31 * 24 * 3600 * 1000,   // a month is already far past any retention
+      );
+      if (from >= to) return new Response("bad range", { status: 400 });
+      return playbackTimeline(new Date(from), new Date(to));
     }
 
     // --- the Adri documents, proxied to the document server ---------------

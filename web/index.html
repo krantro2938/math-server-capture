@@ -47,13 +47,77 @@
   .lag.warn { color: #fbbf24; border-color: #3a3320; }
   .lag.bad  { color: #f87171; border-color: #3a2426; }
   .hint { color: #8b909a; font-size: 13px; }
-  .segs { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; max-height: 46vh;
-          overflow: auto; border: 1px solid #23262d; border-radius: 10px; padding: 6px; }
-  .seg { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 7px;
-         cursor: pointer; font-size: 14px; }
-  .seg:hover { background: #14171c; }
-  .seg.playing { background: #1e293b; color: #93c5fd; }
-  .seg .dur { color: #8b909a; font-variant-numeric: tabular-nums; }
+
+  /* ---- history: the player, the clock, the scrubber -----------------------
+     One continuous recording rather than a list of files, so the two things
+     that have to be on screen at all times are WHERE you are in wall-clock
+     time and WHAT there is either side of it. Hence a stamp burned over the
+     picture and a timeline that is the seek bar. */
+  .stage { position: relative; }
+  .stage video { display: block; }
+  .stamp { position: absolute; left: 12px; top: 12px; padding: 5px 10px; border-radius: 8px;
+           background: rgba(6,8,11,.72); border: 1px solid #23262d; backdrop-filter: blur(6px);
+           font: 600 14px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+           font-variant-numeric: tabular-nums; color: #e7e9ee; letter-spacing: .3px;
+           pointer-events: none; }
+  .stamp .day { display: block; font-size: 11px; font-weight: 500; color: #9aa1ad;
+                letter-spacing: .6px; text-transform: uppercase; }
+  .stamp.gap { color: #fbbf24; }
+
+  /* The scrubber. A canvas rather than DOM nodes: it draws a day of ranges,
+     a tick ladder and a playhead on every pan frame, and 24h of <div>s would
+     be thousands of nodes relaid out on each one. */
+  .tl-wrap { margin-top: 10px; border: 1px solid #23262d; border-radius: 12px;
+             background: #0f1216; padding: 6px 6px 4px; }
+  canvas#tl { display: block; width: 100%; height: 108px; touch-action: none; cursor: crosshair; }
+  canvas#tl.panning { cursor: grabbing; }
+  .tl-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+            padding: 6px 4px 2px; border-top: 1px solid #1a1d23; margin-top: 4px; }
+  .btn.sm { padding: 4px 10px; font-size: 13px; }
+  .btn.on { border-color: #3b82f6; color: #93c5fd; }
+  select.btn { font-family: inherit; }
+  input[type=datetime-local] { padding: 6px 9px; border-radius: 8px; border: 1px solid #2b2f37;
+                               background: #14171c; color: #e7e9ee; font-size: 13px; }
+  .tl-span { font-size: 13px; color: #8b909a; font-variant-numeric: tabular-nums; min-width: 62px; }
+  button.capture { border-color: #3a2f1c; color: #fbbf24; }
+  button.capture:hover { border-color: #fbbf24; }
+  button.capture:disabled { opacity: .45; cursor: default; border-color: #2b2f37; color: #8b909a; }
+
+  /* ---- saved photos ------------------------------------------------------
+     One strip, moved between the Live and History views rather than duplicated
+     into both — same IndexedDB, same object URLs, one place that can be wrong. */
+  #shots { margin-top: 18px; border-top: 1px solid #23262d; padding-top: 12px; }
+  .shots-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .shots-head h3 { font-size: 14px; margin: 0; font-weight: 600; }
+  .strip { display: flex; gap: 10px; overflow-x: auto; padding: 2px 2px 8px; }
+  .shot { margin: 0; flex: none; width: 168px; cursor: pointer; border-radius: 9px;
+          border: 1px solid #23262d; background: #14171c; overflow: hidden; transition: border-color .12s; }
+  .shot:hover { border-color: #3b82f6; }
+  .shot img { display: block; width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; }
+  .shot figcaption { padding: 5px 8px; font-size: 11.5px; color: #9aa1ad;
+                     font-variant-numeric: tabular-nums; white-space: nowrap;
+                     overflow: hidden; text-overflow: ellipsis; }
+  .shot .src { color: #6b717c; }
+
+  /* The big view. Fixed, above the chat widget, and it owns the arrow keys
+     while it is open. */
+  #lightbox { position: fixed; inset: 0; z-index: 60; background: rgba(5,6,9,.92);
+              display: flex; flex-direction: column; align-items: center; justify-content: center;
+              padding: 20px; gap: 12px; }
+  /* Must out-specify `#lightbox`'s own `display: flex` — `.hidden` alone loses
+     to an id selector, and the modal then sits invisibly over the whole page
+     swallowing every click, tabs included. */
+  #lightbox.hidden { display: none; }
+  #lightbox img { max-width: 100%; max-height: calc(100vh - 150px); border-radius: 10px;
+                  border: 1px solid #23262d; background: #000; object-fit: contain; }
+  #lb-cap { font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: #c7ccd6;
+            font-variant-numeric: tabular-nums; text-align: center; }
+  .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); font-size: 30px;
+            padding: 6px 16px; line-height: 1; background: rgba(20,23,28,.8); }
+  #lb-prev { left: 14px; } #lb-next { right: 14px; }
+  #lb-close { position: absolute; top: 14px; right: 14px; }
+  button.danger:hover { border-color: #ef4444; color: #f87171; }
+  @media (max-width: 560px) { .lb-nav { font-size: 24px; padding: 4px 11px; } }
 
   /* The Adri editors. Capped rather than full-bleed: a 2000px-wide textarea is
      one line of maths per screen and nothing to anchor the eye. */
@@ -131,7 +195,7 @@
   <h1>Camera</h1>
   <div class="tabs">
     <button class="tab active" data-tab="live" id="tab-live">● Live</button>
-    <button class="tab" data-tab="rec" id="tab-rec">Recordings</button>
+    <button class="tab" data-tab="history" id="tab-history">History</button>
     <button class="tab" data-tab="adri-assignment" id="tab-adri-assignment">Adri task</button>
     <button class="tab" data-tab="adri-solution" id="tab-adri-solution">Adri answer</button>
     <button class="tab" data-tab="photo" id="tab-photo">Photo</button>
@@ -147,19 +211,55 @@
     <div class="row">
       <button class="btn golive" id="golive" onclick="goLive()">● LIVE</button>
       <span class="lag" id="lag">— s behind</span>
+      <button class="btn capture" id="live-shot">📷 Capture frame</button>
       <span class="hint">Age of the frame on screen. You can scrub back; click LIVE to jump to the edge.</span>
     </div>
+    <div id="slot-live"></div>
   </section>
 
-  <!-- RECORDINGS -->
-  <section id="view-rec" class="hidden">
-    <video id="player" controls playsinline></video>
-    <div class="row">
-      <input type="date" id="date" />
-      <button class="btn" id="load">Load day</button>
-      <span class="hint" id="recinfo"></span>
+  <!-- HISTORY — one continuous recording, scrubbed by wall-clock time. -->
+  <section id="view-history" class="hidden">
+    <div class="stage" id="hist-stage">
+      <!-- No `controls`: MediaMTX serves playback as a progressive stream with
+           `accept-ranges: none`, so the native seek bar can only move inside
+           what is already buffered — it would look like a scrubber and refuse
+           to scrub. The timeline below IS the seek bar, and every seek off the
+           buffer is a fresh request. `muted` because there is no audio track
+           at all, and it makes autoplay unconditional. -->
+      <video id="player" playsinline muted></video>
+      <div class="stamp" id="hist-stamp"><span class="day">—</span>--:--:--</div>
     </div>
-    <div class="segs" id="segs"></div>
+    <div class="row">
+      <button class="btn" id="h-play" title="Play/pause (space)">▶</button>
+      <button class="btn sm" id="h-b60" title="Back 1 minute">−1m</button>
+      <button class="btn sm" id="h-b10" title="Back 10 seconds">−10s</button>
+      <button class="btn sm" id="h-f10" title="Forward 10 seconds">+10s</button>
+      <button class="btn sm" id="h-f60" title="Forward 1 minute">+1m</button>
+      <select class="btn sm" id="h-rate" title="Playback speed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+        <option value="8">8×</option>
+      </select>
+      <button class="btn" id="h-latest" title="Jump to the newest frame recorded">⏭ Newest</button>
+      <button class="btn capture" id="hist-shot">📷 Capture frame</button>
+      <button class="btn sm" id="h-full" title="Fullscreen">⛶</button>
+    </div>
+    <div class="tl-wrap">
+      <canvas id="tl"></canvas>
+      <div class="tl-bar">
+        <button class="btn sm" id="tl-out" title="Zoom out">−</button>
+        <span class="tl-span" id="tl-span">1h</span>
+        <button class="btn sm" id="tl-in" title="Zoom in">+</button>
+        <button class="btn sm" id="tl-all" title="Show everything kept">All</button>
+        <input type="datetime-local" id="tl-goto" step="1" title="Jump to an exact time" />
+        <button class="btn sm" id="tl-go">Go</button>
+        <span class="grow"></span>
+        <span class="hint" id="tl-info">Click the timeline to jump · drag to pan · scroll to zoom</span>
+      </div>
+    </div>
+    <div id="slot-history"></div>
   </section>
 
   <!-- ADRI: two hand-written documents, one of each. Saving replaces what was
@@ -209,6 +309,31 @@
     </div>
   </section>
 </main>
+
+<!-- Saved frames. ONE element, parked here and moved into whichever player is
+     on screen (see mountShots) — two copies would mean two sets of object URLs
+     to revoke and two renders to keep in step. -->
+<div id="shots" class="hidden">
+  <div class="shots-head">
+    <h3>Saved photos</h3>
+    <span class="hint" id="shots-count"></span>
+    <span class="grow"></span>
+    <button class="btn sm danger hidden" id="shots-clear">Clear all</button>
+  </div>
+  <div class="strip" id="shot-strip"></div>
+</div>
+
+<div id="lightbox" class="hidden">
+  <img id="lb-img" alt="saved frame" />
+  <div id="lb-cap"></div>
+  <div class="row">
+    <a class="btn primary" id="lb-download" download>Download</a>
+    <button class="btn danger" id="lb-delete">Delete</button>
+  </div>
+  <button class="btn lb-nav" id="lb-prev" title="Newer (←)">‹</button>
+  <button class="btn lb-nav" id="lb-next" title="Older (→)">›</button>
+  <button class="btn" id="lb-close" title="Close (Esc)">✕</button>
+</div>
 
 <!-- Messages to the glasses. Outside <main> so it survives every tab. -->
 <div id="chat" class="collapsed">
@@ -531,7 +656,7 @@ function updateLiveLag() {
 // a second behind the thing it is measuring.
 setInterval(updateLiveLag, 500);
 
-const VIEWS = ["live", "rec", "adri-assignment", "adri-solution", "photo"];
+const VIEWS = ["live", "history", "adri-assignment", "adri-solution", "photo"];
 
 document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
@@ -544,7 +669,12 @@ document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () 
   if (which === "live") startLive();
   else stopLive();
 
-  if (which === "rec" && !$("#segs").dataset.loaded) loadDay();
+  // Same for history: leaving the tab pauses it, which lets the browser suspend
+  // the open /api/clip download instead of pulling recordings off the VPS's
+  // disk for a tab nobody is looking at.
+  if (which === "history") enterHistory(); else leaveHistory();
+
+  if (which === "live" || which === "history") mountShots(which);
   if (which.startsWith("adri-")) loadDoc(which);
   if (which === "photo") loadPhoto();
 }));
@@ -670,57 +800,794 @@ async function saveDoc(slug) {
   $("#reload-" + slug).addEventListener("click", () => loadDoc(slug));
 });
 
-// ---------- recordings ----------
-const dateEl = $("#date");
-dateEl.value = new Date().toISOString().slice(0, 10);
-let segments = [];
-let playingIdx = -1;
+// ---------- history: one continuous recording -------------------------------
+//
+// There are no "clips" in this UI. What is on disk is a run of 15-minute files
+// which MediaMTX already reports as unbroken TIMESPANS, and the page treats the
+// whole retention window as one recording that happens to have holes in it: you
+// point at a wall-clock time and it plays from there, across file boundaries,
+// across gaps, until you point somewhere else.
+//
+// The mechanics that shape everything below: MediaMTX's playback /get is a
+// progressive stream with `accept-ranges: none` and no duration. So
+//   - seeking outside what is buffered is a NEW REQUEST, not a currentTime
+//     write (which would either restart from zero or hang);
+//   - a clip cannot cross a gap — /get stops dead at one — so the page never
+//     asks for a stretch that spans one, and handles the crossing itself;
+//   - the position is not video time, it is `clipStart + currentTime`, i.e. an
+//     instant. Every control here speaks in instants and converts at the edge.
 
-function fmtTime(iso) {
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
+const pad2 = (n) => String(n).padStart(2, "0");
+const clockOf = (ms) => { const d = new Date(ms); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`; };
+const dayOf = (ms) => new Date(ms).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+const stampOf = (ms) => `${dayOf(ms)} ${clockOf(ms)}`;
+
 function fmtDur(s) {
-  const m = Math.floor(s / 60), sec = Math.round(s % 60);
-  return m ? `${m}m ${sec}s` : `${sec}s`;
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return `${h}h ${pad2(m)}m`;
+  if (m) return `${m}m ${pad2(sec)}s`;
+  return `${sec}s`;
+}
+function fmtSpan(ms) {
+  const s = ms / 1000;
+  if (s >= 86400) return `${(s / 86400).toFixed(s % 86400 ? 1 : 0)}d`;
+  if (s >= 3600)  return `${(s / 3600).toFixed(s % 3600 ? 1 : 0)}h`;
+  if (s >= 60)    return `${Math.round(s / 60)}m`;
+  return `${Math.round(s)}s`;
 }
 
-async function loadDay() {
-  const date = dateEl.value;
-  $("#recinfo").textContent = "Loading…";
-  $("#segs").dataset.loaded = "1";
+// How far back to ask for. A little more than the 24h retention, so the oldest
+// thing still on disk is always inside the window rather than at its edge.
+const HISTORY_HOURS = 30;
+// Ceiling on a single /api/clip. Nothing forces one — the browser suspends the
+// download once it is buffered far enough ahead — but a request that can run
+// for a day is a connection nothing ever closes. An hour means at worst one
+// reload per hour of continuous watching, and that reload is invisible.
+const MAX_CLIP_S = 3600;
+
+const TL = {
+  ranges: [],        // [{s, e}] ms — where video exists, newest last
+  now: 0,            // server clock at the last refresh, + local drift since
+  nowAt: 0,          // performance-clock reading when `now` was taken
+  viewStart: 0,      // ms — left edge of the drawn window
+  viewSpan: 3600e3,  // ms — how much time is on screen
+  playhead: null,    // ms — the frame on screen
+  hover: null,       // ms — under the cursor
+  pannedAt: 0,       // last manual pan/zoom, so follow-mode backs off
+};
+
+let clipStart = null;   // wall-clock ms of this clip's t=0
+let clipTo = null;      // wall-clock ms it was asked to reach
+let clipAt = 0;         // when it was requested (Date.now)
+let emptyRetries = 0;
+let histActive = false;
+let tlTimer = null;
+
+const serverNow = () => TL.now + (performance.now() - TL.nowAt);
+const histTime = () => (clipStart == null ? null : clipStart + player.currentTime * 1000);
+const dataMin = () => (TL.ranges.length ? TL.ranges[0].s : serverNow() - 3600e3);
+const dataMax = () => (TL.ranges.length ? TL.ranges[TL.ranges.length - 1].e : serverNow());
+
+function setInfo(msg) { $("#tl-info").textContent = msg; }
+
+// ---------- what exists ----------
+async function refreshTimeline({ quiet = false } = {}) {
+  const to = new Date(Date.now() + 60e3).toISOString();
+  const from = new Date(Date.now() - HISTORY_HOURS * 3600e3).toISOString();
   try {
-    const res = await fetch(`/api/recordings?date=${date}`);
-    segments = await res.json();
-  } catch { segments = []; }
-  const list = $("#segs");
-  list.innerHTML = "";
-  if (!segments.length) {
-    $("#recinfo").textContent = "No recordings for this day.";
+    const res = await fetch(`/api/timeline?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const j = await res.json();
+    TL.ranges = (j.ranges || [])
+      .map((r) => ({ s: Date.parse(r.start), e: Date.parse(r.end) }))
+      .filter((r) => Number.isFinite(r.s) && r.e > r.s);
+    TL.now = Date.parse(j.now);
+    TL.nowAt = performance.now();
+  } catch (e) {
+    if (!quiet) setInfo("Could not load the timeline: " + e.message);
+    return false;
+  }
+  tlDraw();
+  return true;
+}
+
+// ---------- where we are allowed to be ----------
+const rangeAt = (t) => TL.ranges.find((r) => t >= r.s - 400 && t < r.e);
+const rangeAfter = (t) => TL.ranges.find((r) => r.s > t);
+
+/**
+ * Put the playhead at an instant. Snaps forward to the next recorded moment if
+ * `t` lands in a hole, because a DVR that lets you park on nothing is a DVR
+ * that looks broken.
+ */
+function seekTo(t, { force = false } = {}) {
+  if (!TL.ranges.length) { setInfo("Nothing recorded in the last day."); return; }
+  t = Math.min(Math.max(t, dataMin()), dataMax() - 250);
+
+  let r = rangeAt(t);
+  if (!r) {
+    const nx = rangeAfter(t);
+    if (nx) { t = nx.s; r = nx; }
+    else { r = TL.ranges[TL.ranges.length - 1]; t = Math.max(r.s, r.e - 5000); }
+  }
+
+  // Already downloaded? Then this is just a currentTime write — which is what
+  // makes ±10s feel instant instead of costing a round trip and a keyframe.
+  if (!force && clipStart != null && t >= clipStart) {
+    const b = player.buffered;
+    const rel = (t - clipStart) / 1000;
+    if (b.length && rel <= b.end(b.length - 1) - 0.25) {
+      player.currentTime = rel;
+      TL.playhead = t;
+      tlDraw();
+      return;
+    }
+  }
+  loadClip(t, r);
+}
+
+function loadClip(t, r) {
+  // +30s past the end we know about: the newest range is still being written,
+  // so asking slightly beyond it picks up whatever landed since the last
+  // refresh. MediaMTX just stops early when it runs out, which is handled.
+  const dur = Math.min(MAX_CLIP_S, Math.max(10, (r.e - t) / 1000 + 30));
+  clipStart = t;
+  clipTo = t + dur * 1000;
+  clipAt = Date.now();
+  TL.playhead = t;
+  player.src = `/api/clip?start=${encodeURIComponent(new Date(t).toISOString())}&duration=${dur.toFixed(3)}`;
+  player.load();
+  player.play().catch(() => {});
+  tlDraw();
+}
+
+// Playback rate does not survive a src change, so it is reapplied per clip
+// rather than set once — otherwise every gap crossing silently drops you to 1×.
+let histRate = 1;
+player.addEventListener("loadedmetadata", () => { player.playbackRate = histRate; });
+
+/**
+ * The end of a clip is never the end of the recording. Three cases, and telling
+ * them apart is the whole job: the newest range grew while we were playing it
+ * (continue), we hit a real hole (skip it and say so), or the request came back
+ * with nothing at all (the live edge is still being written — wait and retry).
+ */
+async function onClipEnd(failed = false) {
+  if (!histActive || clipStart == null) return;
+  const played = player.currentTime * 1000;
+  const reached = clipStart + played;
+  await refreshTimeline({ quiet: true });
+
+  if (played < 500) {
+    if (++emptyRetries <= 3) {
+      setInfo("Waiting for the recording to catch up…");
+      // A request that ERRORED at a spot the timeline swears exists is a
+      // boundary problem, not a slow one — retrying the identical instant just
+      // gets the identical 404. Step forward a second each time so a bad edge
+      // can never wedge playback; an empty-but-OK response is the live edge
+      // still being written, where the same instant is exactly right to retry.
+      const retryAt = reached + (failed ? emptyRetries * 1000 : 0);
+      setTimeout(() => { if (histActive) seekTo(retryAt, { force: true }); }, failed ? 400 : 2000);
+      return;
+    }
+    emptyRetries = 0;
+    const after = rangeAfter(reached + 1000);
+    if (!after) { setInfo("This is the newest frame recorded."); return; }
+    setInfo(`Skipped ${fmtDur((after.s - reached) / 1000)} with no recording.`);
+    seekTo(after.s, { force: true });
     return;
   }
-  const total = segments.reduce((a, s) => a + s.duration, 0);
-  $("#recinfo").textContent = `${segments.length} segment(s), ${fmtDur(total)} total`;
-  segments.forEach((s, i) => {
-    const row = document.createElement("div");
-    row.className = "seg";
-    row.innerHTML = `<span>${fmtTime(s.start)}</span><span class="dur">${fmtDur(s.duration)}</span>`;
-    row.addEventListener("click", () => play(i));
-    list.appendChild(row);
+
+  emptyRetries = 0;
+  if (rangeAt(reached + 250)) { seekTo(reached, { force: true }); return; }  // grew, or clip cap
+  const after = rangeAfter(reached);
+  if (!after) { setInfo("This is the newest frame recorded."); return; }
+  setInfo(`Skipped ${fmtDur((after.s - reached) / 1000)} with no recording.`);
+  seekTo(after.s, { force: true });
+}
+player.addEventListener("ended", onClipEnd);
+// A 404 from the playback API means the recording was purged out from under us
+// (or never existed at that instant). Same recovery as an empty clip.
+player.addEventListener("error", () => {
+  if (!histActive || clipStart == null) return;
+  if (Date.now() - clipAt > 30000) return;    // not ours; ignore late errors
+  onClipEnd(true);
+});
+
+// ---------- the clock over the picture ----------
+let stampRaf = 0, lastTick = 0;
+function tickStamp(ts) {
+  stampRaf = requestAnimationFrame(tickStamp);
+  if (!histActive) return;
+  // rAF for the schedule, 10fps for the work: the clock only changes once a
+  // second and the playhead moves a fraction of a pixel per frame, so redrawing
+  // the canvas 60 times a second is heat, not smoothness.
+  if (ts - lastTick < 100) return;
+  lastTick = ts;
+  const t = histTime();
+  const el = $("#hist-stamp");
+  if (t != null) {
+    el.innerHTML = `<span class="day">${dayOf(t)}</span>${clockOf(t)}`;
+    TL.playhead = t;
+    followPlayhead();
+    tlDraw();
+  }
+  $("#h-play").textContent = player.paused ? "▶" : "❚❚";
+}
+
+// Keep the playhead on screen while it plays — but never fight a pan. Six
+// seconds of quiet after you last touched the timeline before it takes over.
+function followPlayhead() {
+  if (TL.playhead == null || player.paused) return;
+  if (Date.now() - TL.pannedAt < 6000) return;
+  const rel = (TL.playhead - TL.viewStart) / TL.viewSpan;
+  if (rel < 0.15 || rel > 0.85) TL.viewStart = TL.playhead - TL.viewSpan * 0.5;
+}
+
+// ---------- the timeline ----------
+const tlCanvas = $("#tl");
+
+// Tick ladder: the smallest step that still leaves room for a label.
+const TICK_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600,
+                    7200, 10800, 21600, 43200, 86400].map((s) => s * 1000);
+
+function tlClamp() {
+  const lo0 = dataMin(), hi0 = Math.max(dataMax(), serverNow());
+  const total = Math.max(120e3, hi0 - lo0);
+  TL.viewSpan = Math.min(Math.max(TL.viewSpan, 20e3), total * 1.6);
+  const pad = TL.viewSpan * 0.12;
+  const lo = lo0 - pad, hi = hi0 + pad;
+  TL.viewStart = TL.viewSpan >= hi - lo
+    ? (lo + hi) / 2 - TL.viewSpan / 2
+    : Math.min(Math.max(TL.viewStart, lo), hi - TL.viewSpan);
+  $("#tl-span").textContent = fmtSpan(TL.viewSpan);
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+function tlDraw() {
+  const c = tlCanvas;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (!w || !h) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(h * dpr);
+  }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+
+  tlClamp();
+  const t0 = TL.viewStart, span = TL.viewSpan;
+  const xOf = (t) => ((t - t0) / span) * w;
+  const tOf = (x) => t0 + (x / w) * span;
+
+  const top = 30, trackH = h - top - 20;
+
+  g.fillStyle = "#0b0e12";
+  rr(g, 0, top, w, trackH, 8);
+  g.fill();
+
+  // --- recorded ranges ---
+  const grad = g.createLinearGradient(0, top, 0, top + trackH);
+  grad.addColorStop(0, "#3b82f6");
+  grad.addColorStop(1, "#1d4ed8");
+  g.save();
+  rr(g, 0, top, w, trackH, 8);
+  g.clip();
+  for (const r of TL.ranges) {
+    const a = xOf(r.s), b = xOf(r.e);
+    if (b < -2 || a > w + 2) continue;
+    g.fillStyle = grad;
+    // 1.5px floor: a 9-second range in a 24-hour view is a fifth of a pixel,
+    // and a gap you cannot see is a gap you cannot click.
+    g.fillRect(Math.max(-1, a), top, Math.max(1.5, Math.min(w + 1, b) - Math.max(-1, a)), trackH);
+  }
+  g.restore();
+
+  // --- ticks + labels ---
+  const step = TICK_STEPS.find((s) => (s / span) * w >= 76) ?? TICK_STEPS[TICK_STEPS.length - 1];
+  // Align to LOCAL time, not to the epoch: at a 1-hour step the epoch and the
+  // local hour only coincide in whole-hour zones, and in the others every
+  // label read :30 or :45.
+  const tzOff = new Date(t0).getTimezoneOffset() * 60000;
+  const first = Math.ceil((t0 - tzOff) / step) * step + tzOff;
+  g.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  g.textBaseline = "alphabetic";
+  for (let t = first; t < t0 + span; t += step) {
+    const x = Math.round(xOf(t)) + 0.5;
+    g.strokeStyle = "rgba(255,255,255,.08)";
+    g.beginPath(); g.moveTo(x, top); g.lineTo(x, top + trackH); g.stroke();
+    const d = new Date(t);
+    const midnight = d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0;
+    g.fillStyle = midnight ? "#c7ccd6" : "#7d8490";
+    // Centred labels get clipped by the canvas edge — the leftmost one read
+    // "8:30" for 12:58:30. Pin the outermost two inside instead.
+    g.textAlign = x < 42 ? "left" : x > w - 42 ? "right" : "center";
+    g.fillText(
+      step >= 86400e3 || midnight
+        ? d.toLocaleDateString([], { day: "numeric", month: "short" })
+        : step >= 60e3 ? `${pad2(d.getHours())}:${pad2(d.getMinutes())}` : clockOf(t),
+      Math.min(Math.max(x, 1), w - 1), top - 10,
+    );
+  }
+
+  // --- the live edge ---
+  const nowX = xOf(serverNow());
+  if (nowX >= 0 && nowX <= w) {
+    g.strokeStyle = "#f59e0b";
+    g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(nowX, top); g.lineTo(nowX, top + trackH); g.stroke();
+    g.setLineDash([]);
+  }
+
+  // --- hover ---
+  if (TL.hover != null) {
+    const x = xOf(TL.hover);
+    if (x >= 0 && x <= w) {
+      g.strokeStyle = "rgba(231,233,238,.35)";
+      g.beginPath(); g.moveTo(x, top); g.lineTo(x, top + trackH); g.stroke();
+      g.fillStyle = "#9aa1ad";
+      g.textAlign = x > w - 60 ? "right" : x < 60 ? "left" : "center";
+      g.fillText(clockOf(TL.hover), x, h - 6);
+    }
+  }
+
+  // --- playhead ---
+  if (TL.playhead != null) {
+    const x = Math.round(xOf(TL.playhead)) + 0.5;
+    if (x >= -6 && x <= w + 6) {
+      g.strokeStyle = "#ef4444";
+      g.lineWidth = 2;
+      g.beginPath(); g.moveTo(x, top - 4); g.lineTo(x, top + trackH + 4); g.stroke();
+      g.lineWidth = 1;
+      g.fillStyle = "#ef4444";
+      g.beginPath();
+      g.moveTo(x - 5, top - 9); g.lineTo(x + 5, top - 9); g.lineTo(x, top - 2);
+      g.closePath(); g.fill();
+    }
+  }
+
+  if (!TL.ranges.length) {
+    g.fillStyle = "#6b717c";
+    g.textAlign = "center";
+    g.fillText("no recordings in the last 24 hours", w / 2, top + trackH / 2 + 4);
+  }
+}
+
+// ---------- timeline input ----------
+// Pointer events throughout, so a phone gets drag-to-pan and pinch-to-zoom off
+// the same code as a mouse. A press that does not move is a seek; anything else
+// is a pan, which is why `moved` is tracked rather than a separate scrub mode.
+const tlPtrs = new Map();
+let panFrom = 0, panView = 0, panMoved = 0, pinchDist = 0, pinchSpan = 0, pinchAnchorT = 0;
+
+const tlX = (e) => e.clientX - tlCanvas.getBoundingClientRect().left;
+const tlTimeAt = (x) => TL.viewStart + (x / tlCanvas.clientWidth) * TL.viewSpan;
+
+function zoomAround(x, factor) {
+  const t = tlTimeAt(x);
+  const before = TL.viewSpan;
+  TL.viewSpan = Math.max(20e3, TL.viewSpan * factor);
+  tlClamp();
+  if (TL.viewSpan !== before) {
+    // Keep the instant under the cursor pinned to the cursor.
+    TL.viewStart = t - (x / tlCanvas.clientWidth) * TL.viewSpan;
+  }
+  TL.pannedAt = Date.now();
+  tlDraw();
+}
+
+tlCanvas.addEventListener("pointerdown", (e) => {
+  tlCanvas.setPointerCapture(e.pointerId);
+  tlPtrs.set(e.pointerId, e.clientX);
+  if (tlPtrs.size === 1) {
+    panFrom = e.clientX; panView = TL.viewStart; panMoved = 0;
+  } else if (tlPtrs.size === 2) {
+    const [a, b] = [...tlPtrs.values()];
+    pinchDist = Math.max(1, Math.abs(a - b));
+    pinchSpan = TL.viewSpan;
+    pinchAnchorT = tlTimeAt((a + b) / 2 - tlCanvas.getBoundingClientRect().left);
+  }
+});
+
+tlCanvas.addEventListener("pointermove", (e) => {
+  TL.hover = tlTimeAt(tlX(e));
+  if (tlPtrs.has(e.pointerId)) tlPtrs.set(e.pointerId, e.clientX);
+
+  if (tlPtrs.size >= 2) {
+    const [a, b] = [...tlPtrs.values()];
+    const dist = Math.max(1, Math.abs(a - b));
+    TL.viewSpan = Math.max(20e3, pinchSpan * (pinchDist / dist));
+    tlClamp();
+    const cx = (a + b) / 2 - tlCanvas.getBoundingClientRect().left;
+    TL.viewStart = pinchAnchorT - (cx / tlCanvas.clientWidth) * TL.viewSpan;
+    TL.pannedAt = Date.now();
+  } else if (tlPtrs.size === 1) {
+    const dx = e.clientX - panFrom;
+    panMoved = Math.max(panMoved, Math.abs(dx));
+    if (panMoved > 4) {
+      tlCanvas.classList.add("panning");
+      TL.viewStart = panView - (dx / tlCanvas.clientWidth) * TL.viewSpan;
+      TL.pannedAt = Date.now();
+    }
+  }
+  tlDraw();
+});
+
+function tlRelease(e) {
+  if (!tlPtrs.has(e.pointerId)) return;
+  const wasSingle = tlPtrs.size === 1;
+  tlPtrs.delete(e.pointerId);
+  tlCanvas.classList.remove("panning");
+  if (wasSingle && panMoved <= 4) {
+    TL.pannedAt = Date.now();
+    seekTo(tlTimeAt(tlX(e)));
+  }
+}
+tlCanvas.addEventListener("pointerup", tlRelease);
+tlCanvas.addEventListener("pointercancel", tlRelease);
+tlCanvas.addEventListener("pointerleave", () => { TL.hover = null; tlDraw(); });
+
+tlCanvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  // Trackpads send fractional deltas by the dozen; the exponential keeps a
+  // flick and a click-wheel notch feeling like the same gesture.
+  zoomAround(tlX(e), Math.exp(e.deltaY * 0.0016));
+}, { passive: false });
+
+$("#tl-in").addEventListener("click", () => zoomAround(tlCanvas.clientWidth / 2, 0.5));
+$("#tl-out").addEventListener("click", () => zoomAround(tlCanvas.clientWidth / 2, 2));
+$("#tl-all").addEventListener("click", () => {
+  TL.viewSpan = Math.max(120e3, Math.max(dataMax(), serverNow()) - dataMin());
+  TL.viewStart = dataMin();
+  TL.pannedAt = Date.now();
+  tlDraw();
+});
+$("#tl-go").addEventListener("click", () => {
+  const v = $("#tl-goto").value;
+  if (!v) return;
+  const t = new Date(v).getTime();     // datetime-local is LOCAL time; so is this
+  if (!Number.isFinite(t)) return;
+  TL.viewStart = t - TL.viewSpan / 2;
+  TL.pannedAt = Date.now();
+  seekTo(t, { force: true });
+});
+$("#tl-goto").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#tl-go").click(); });
+// Seeded from where you are, so "go to a time" is an edit rather than typing a
+// full date — and so the field shows which day it is asking about.
+const localInputValue = (ms) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
+         `T${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+};
+$("#tl-goto").addEventListener("focus", () => {
+  if (!$("#tl-goto").value && TL.playhead != null) $("#tl-goto").value = localInputValue(TL.playhead);
+});
+
+// ---------- history controls ----------
+$("#h-play").addEventListener("click", () => {
+  if (player.paused) { if (clipStart == null) seekTo(dataMax() - 60e3); else player.play().catch(() => {}); }
+  else player.pause();
+});
+const skip = (d) => { const t = histTime(); if (t != null) seekTo(t + d); };
+$("#h-b60").addEventListener("click", () => skip(-60e3));
+$("#h-b10").addEventListener("click", () => skip(-10e3));
+$("#h-f10").addEventListener("click", () => skip(10e3));
+$("#h-f60").addEventListener("click", () => skip(60e3));
+$("#h-rate").addEventListener("change", (e) => {
+  histRate = Number(e.target.value) || 1;
+  player.playbackRate = histRate;
+});
+$("#h-latest").addEventListener("click", async () => {
+  await refreshTimeline({ quiet: true });
+  // 20s back rather than the exact edge: the newest moments are still being
+  // written, and a request that lands past them comes back empty.
+  seekTo(dataMax() - 20e3, { force: true });
+  TL.viewStart = dataMax() - TL.viewSpan * 0.85;
+  TL.pannedAt = 0;
+});
+$("#h-full").addEventListener("click", () => {
+  const el = $("#hist-stage");
+  if (document.fullscreenElement) document.exitFullscreen();
+  else el.requestFullscreen?.().catch(() => {});
+});
+
+// Space toggles play/pause, but only when nothing is being typed into — the
+// chat composer and the Adri editors are both one keystroke away at all times.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== " " || !histActive) return;
+  const t = e.target;
+  if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable)) return;
+  if (!$("#lightbox").classList.contains("hidden")) return;
+  e.preventDefault();
+  $("#h-play").click();
+});
+
+// ---------- entering / leaving the tab ----------
+async function enterHistory() {
+  histActive = true;
+  const first = !TL.ranges.length;
+  const ok = await refreshTimeline();
+  if (!ok) return;
+  if (!TL.ranges.length) { setInfo("Nothing recorded in the last day."); tlDraw(); return; }
+  if (first || clipStart == null) {
+    // Open on the newest thing there is: this is a camera, and "what happened
+    // just now" is the question being asked nine times out of ten.
+    TL.viewSpan = 3600e3;
+    TL.viewStart = dataMax() - TL.viewSpan * 0.85;
+    seekTo(dataMax() - 60e3, { force: true });
+    $("#tl-goto").value = localInputValue(dataMax() - 60e3);
+    setInfo("Click the timeline to jump · drag to pan · scroll to zoom");
+  } else {
+    player.play().catch(() => {});
+  }
+  if (!stampRaf) stampRaf = requestAnimationFrame(tickStamp);
+  if (!tlTimer) tlTimer = setInterval(() => refreshTimeline({ quiet: true }), 20000);
+}
+
+function leaveHistory() {
+  histActive = false;
+  player.pause();
+  if (stampRaf) { cancelAnimationFrame(stampRaf); stampRaf = 0; }
+  if (tlTimer) { clearInterval(tlTimer); tlTimer = null; }
+}
+
+window.addEventListener("resize", () => { if (histActive) tlDraw(); });
+
+// ---------- saved photos ----------------------------------------------------
+//
+// Capture is a canvas draw off whichever <video> is on screen, so it is the
+// exact frame you were looking at — not a second RTSP connection and a fresh
+// decode, which is what /api/snapshot.jpg does and which would hand back a
+// DIFFERENT moment (and nothing at all while you are scrubbed back into
+// history). Both surfaces are same-origin, so the canvas is never tainted.
+//
+// The result is kept in IndexedDB rather than localStorage because these are
+// Blobs — megabytes each, and localStorage is a ~5MB string store. It is also
+// the reason the strip shows a downscaled thumbnail and the modal reads the
+// full blob: rendering twenty 1080p frames as <img> at once is 60MB of decoded
+// bitmap for pictures being displayed 168px wide.
+
+const DB_NAME = "camshots", DB_VER = 1, STORE = "shots";
+let dbPromise = null;
+let idbBroken = false;
+
+function db() {
+  if (!dbPromise) {
+    dbPromise = new Promise((res, rej) => {
+      const rq = indexedDB.open(DB_NAME, DB_VER);
+      rq.onupgradeneeded = () => {
+        const d = rq.result;
+        if (!d.objectStoreNames.contains(STORE)) {
+          d.createObjectStore(STORE, { keyPath: "id", autoIncrement: true }).createIndex("at", "at");
+        }
+      };
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+      // Private windows and "block all cookies" both land here.
+      rq.onblocked = () => rej(new Error("database blocked"));
+    });
+  }
+  return dbPromise;
+}
+
+function shotOp(mode, fn) {
+  return db().then((d) => new Promise((res, rej) => {
+    const t = d.transaction(STORE, mode);
+    const rq = fn(t.objectStore(STORE));
+    t.oncomplete = () => res(rq ? rq.result : undefined);
+    t.onerror = () => rej(t.error);
+    t.onabort = () => rej(t.error);
+  }));
+}
+
+const shotAdd = (rec) => shotOp("readwrite", (st) => st.add(rec));
+const shotDel = (id) => shotOp("readwrite", (st) => st.delete(id));
+const shotClear = () => shotOp("readwrite", (st) => st.clear());
+const shotAll = () => shotOp("readonly", (st) => st.getAll())
+  .then((rows) => (rows || []).sort((a, b) => b.at - a.at));   // newest first
+
+// ---------- capture ----------
+const shotsEl = $("#shots");
+let shots = [];
+const shotUrls = new Map();     // id -> thumbnail object URL, revoked on re-render
+
+/** Wall-clock instant of the frame currently on screen in the live player. */
+function liveFrameTime() {
+  // playingDate is EXT-X-PROGRAM-DATE-TIME for the frame being shown, i.e. the
+  // moment the camera captured it — which is what belongs on a saved photo,
+  // not the moment you clicked (a second or two later).
+  if (hls && hls.playingDate instanceof Date && !isNaN(hls.playingDate)) return hls.playingDate.getTime();
+  const r = trueLatency();
+  if (r && isFinite(r.s)) return Date.now() - Math.max(0, r.s) * 1000;
+  return Date.now();
+}
+
+function thumbOf(src, width) {
+  const scale = Math.min(1, width / src.width);
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(src.width * scale));
+  c.height = Math.max(1, Math.round(src.height * scale));
+  c.getContext("2d").drawImage(src, 0, 0, c.width, c.height);
+  return new Promise((r) => c.toBlob(r, "image/jpeg", 0.72));
+}
+
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+function shotName(at) {
+  const d = new Date(at);
+  return `cam-${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` +
+         `_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}.jpg`;
+}
+
+async function captureFrame(source) {
+  const v = source === "live" ? liveVideo : player;
+  const btn = source === "live" ? $("#live-shot") : $("#hist-shot");
+  if (!v.videoWidth || !v.videoHeight) {
+    setShotNote(source, "No frame to capture yet.");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const at = source === "live" ? liveFrameTime() : (histTime() ?? Date.now());
+    const c = document.createElement("canvas");
+    c.width = v.videoWidth;
+    c.height = v.videoHeight;
+    c.getContext("2d").drawImage(v, 0, 0);
+    const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.92));
+    if (!blob) throw new Error("the browser could not encode the frame");
+
+    // Download first, store second. If IndexedDB is unavailable (private
+    // window, storage denied) you still get the file — the gallery is the part
+    // that degrades, and it says so rather than swallowing the click.
+    downloadBlob(blob, shotName(at));
+
+    const rec = { at, savedAt: Date.now(), source, w: c.width, h: c.height, blob };
+    try {
+      rec.thumb = await thumbOf(c, 336);
+      await shotAdd(rec);
+      await renderShots();
+      setShotNote(source, "");
+    } catch (e) {
+      idbBroken = true;
+      renderShots();
+      setShotNote(source, "Downloaded, but this browser won't keep a gallery: " + (e.message || e));
+    }
+  } catch (e) {
+    setShotNote(source, "Capture failed: " + (e.message || e));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function setShotNote(source, msg) {
+  if (source === "history") setInfo(msg || "Click the timeline to jump · drag to pan · scroll to zoom");
+  else if (msg) console.warn(msg);
+  $("#shots-count").textContent = msg || $("#shots-count").dataset.base || "";
+}
+
+$("#live-shot").addEventListener("click", () => captureFrame("live"));
+$("#hist-shot").addEventListener("click", () => captureFrame("history"));
+
+// ---------- the strip ----------
+function mountShots(view) {
+  const slot = $("#slot-" + view);
+  if (slot && shotsEl.parentElement !== slot) slot.appendChild(shotsEl);
+  shotsEl.classList.remove("hidden");
+}
+
+async function renderShots() {
+  try { shots = idbBroken ? [] : await shotAll(); }
+  catch { shots = []; idbBroken = true; }
+
+  for (const url of shotUrls.values()) URL.revokeObjectURL(url);
+  shotUrls.clear();
+
+  const strip = $("#shot-strip");
+  strip.innerHTML = "";
+  const base = shots.length
+    ? `${shots.length} saved on this device`
+    : (idbBroken ? "This browser is not storing a gallery." : "Nothing saved yet — press Capture frame.");
+  $("#shots-count").dataset.base = base;
+  $("#shots-count").textContent = base;
+  $("#shots-clear").classList.toggle("hidden", !shots.length);
+
+  shots.forEach((s, i) => {
+    const url = URL.createObjectURL(s.thumb || s.blob);
+    shotUrls.set(s.id, url);
+    const fig = document.createElement("figure");
+    fig.className = "shot";
+    fig.title = `${stampOf(s.at)} — click to enlarge`;
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = `frame from ${stampOf(s.at)}`;
+    img.loading = "lazy";
+    const cap = document.createElement("figcaption");
+    cap.textContent = clockOf(s.at) + " ";
+    const src = document.createElement("span");
+    src.className = "src";
+    src.textContent = dayOf(s.at) + (s.source === "live" ? " · live" : "");
+    cap.appendChild(src);
+    fig.append(img, cap);
+    fig.addEventListener("click", () => openShot(i));
+    strip.appendChild(fig);
   });
 }
 
-function play(i) {
-  if (i < 0 || i >= segments.length) return;
-  playingIdx = i;
-  document.querySelectorAll(".seg").forEach((el, idx) => el.classList.toggle("playing", idx === i));
-  player.src = segments[i].url;
-  player.play().catch(() => {});
-  player.scrollIntoView({ behavior: "smooth", block: "start" });
+$("#shots-clear").addEventListener("click", async () => {
+  if (!shots.length || !confirm(`Delete all ${shots.length} saved photos from this device?`)) return;
+  await shotClear();
+  closeShot();
+  renderShots();
+});
+
+// ---------- the big view ----------
+let lbIdx = -1, lbUrl = null;
+
+function openShot(i) {
+  if (i < 0 || i >= shots.length) return;
+  lbIdx = i;
+  const s = shots[i];
+  if (lbUrl) URL.revokeObjectURL(lbUrl);
+  lbUrl = URL.createObjectURL(s.blob);
+  $("#lb-img").src = lbUrl;
+  $("#lb-cap").textContent = `${stampOf(s.at)} · ${s.source === "live" ? "Live" : "History"} · ${s.w}×${s.h}`;
+  const dl = $("#lb-download");
+  dl.href = lbUrl;
+  dl.setAttribute("download", shotName(s.at));
+  $("#lb-prev").disabled = i === 0;
+  $("#lb-next").disabled = i === shots.length - 1;
+  $("#lightbox").classList.remove("hidden");
 }
 
-// Auto-advance to the next segment for continuous playback.
-player.addEventListener("ended", () => { if (playingIdx + 1 < segments.length) play(playingIdx + 1); });
-$("#load").addEventListener("click", loadDay);
+function closeShot() {
+  $("#lightbox").classList.add("hidden");
+  $("#lb-img").removeAttribute("src");
+  if (lbUrl) { URL.revokeObjectURL(lbUrl); lbUrl = null; }
+  lbIdx = -1;
+}
+
+$("#lb-close").addEventListener("click", closeShot);
+$("#lightbox").addEventListener("click", (e) => { if (e.target.id === "lightbox") closeShot(); });
+$("#lb-prev").addEventListener("click", () => openShot(lbIdx - 1));
+$("#lb-next").addEventListener("click", () => openShot(lbIdx + 1));
+$("#lb-delete").addEventListener("click", async () => {
+  if (lbIdx < 0) return;
+  const gone = shots[lbIdx].id;
+  const at = lbIdx;
+  await shotDel(gone);
+  await renderShots();
+  if (!shots.length) closeShot();
+  else openShot(Math.min(at, shots.length - 1));
+});
+
+document.addEventListener("keydown", (e) => {
+  if ($("#lightbox").classList.contains("hidden")) return;
+  if (e.key === "Escape") { e.preventDefault(); closeShot(); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); openShot(lbIdx - 1); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); openShot(lbIdx + 1); }
+});
 
 // ---------- messages to the glasses ----------
 //
@@ -918,7 +1785,9 @@ subscribeMessages();
 // touching the server: the status it is rendering is already in hand.
 setInterval(loadMessages, 60000);
 
-// Boot into live.
+// Boot into live, with the gallery under it.
+mountShots("live");
+renderShots();
 startLive();
 </script>
 </body>
