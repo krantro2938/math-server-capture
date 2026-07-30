@@ -59,5 +59,8 @@ cat <<EOF
          python $REPO/discover.py --uid G683009DYDYB
     3. Start it:           bash $REPO/phone/termux-run.sh
        Watch the log:      tail -f ~/lookcam.log
-    4. It also starts automatically on every reboot now (Termux:Boot -> $BOOT).
+    4. It also starts automatically on every reboot now (Termux:Boot -> $BOOT),
+       headless — so after a reboot it is ALREADY streaming even though no
+       Termux session shows it. Starting a second one would make both flap, so
+       termux-run.sh refuses; add --force to take over instead.
 EOF

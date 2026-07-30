@@ -104,8 +104,25 @@ printed as part of the URL, and required on every route but `/health`.
 idea to leave on, which is why it says so on startup every time.
 
 It never writes, deletes or moves anything, and serves only files under the
-configured roots with an image extension. `id` is resolved against a fresh
-listing rather than used as a path, so it cannot be walked out of the gallery.
+configured roots with an image extension. `id` arrives from the client, so
+`/photo` re-checks it — resolved first, then required to land inside a root —
+and it cannot be walked or symlinked out of the gallery.
+
+## What counts as a photo
+
+Two things are skipped, and both of them are the difference between publishing
+your photo and publishing nothing:
+
+- **anything hidden** — any file or directory whose name starts with `.`. Phones
+  keep app caches and thumbnails in `Pictures/.gs_fs0`, `DCIM/.thumbnails` and
+  friends. Those are rewritten constantly, so without this a 43-byte cache
+  placeholder has a fresher mtime than the shot you just took and *is* the
+  newest photo. They also hold most of the files on the device, so not walking
+  them is most of what makes a scan fast enough not to time out.
+- **anything under 4 KB** — a cheap second guard for junk that isn't hidden. Well
+  below a real photo, well above a placeholder.
+
+If a photo of yours is genuinely missing, this is the first place to look.
 
 ## Options
 

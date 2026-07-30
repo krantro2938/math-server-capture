@@ -45,6 +45,7 @@ import mimetypes
 import os
 import secrets
 import signal
+import stat as stat_module
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +76,26 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 # is what would make this feel slow.
 MAX_SCAN = 4000
 DEFAULT_RECENT = 12
+
+# Every app on the phone keeps its caches and thumbnails in a dot-directory
+# under Pictures or DCIM — /sdcard/Pictures/.gs_fs0 (the Google app),
+# .thumbnails, and a dozen others. They matter here for two reasons, and both
+# of them are bugs if you ignore them:
+#
+#   they are rewritten constantly, so a 43-byte cache placeholder has a newer
+#   mtime than the photo you just took and wins "newest first"
+#
+#   they hold most of the files on the device, so walking them is most of the
+#   time a scan takes — and a scan happens on every single request
+#
+# Nothing anyone wants to publish lives in a hidden directory, so this skips
+# them entirely rather than trying to tell good ones from bad.
+SKIP_HIDDEN = True
+
+# A second, cheaper guard for junk that isn't hidden. Real photos are hundreds
+# of kilobytes; this only has to be above "obviously a placeholder", and low
+# enough that a small screenshot or a webp still counts.
+MIN_IMAGE_BYTES = 4096
 
 # ── auth ────────────────────────────────────────────────────────────────────
 #
@@ -117,49 +138,108 @@ def load_or_create_token() -> str:
 
 def scan(roots: list[Path]) -> list[dict]:
     """Every image under `roots`, newest first, as plain metadata."""
-    found: list[tuple[float, Path]] = []
+    found: list[tuple[float, Path, int]] = []
     seen: set[Path] = set()
 
     for root in roots:
         if not root.is_dir():
             continue
-        for path in root.rglob("*"):
+        try:
+            base = root.expanduser().resolve()
+        except OSError:
+            continue
+        # os.walk rather than rglob because only os.walk lets us decline to
+        # descend: rglob would still walk every file in .gs_fs0 and .thumbnails
+        # before we got the chance to reject them one at a time.
+        for dirpath, dirnames, filenames in os.walk(base, onerror=None):
+            if SKIP_HIDDEN:
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             if len(found) >= MAX_SCAN:
                 break
-            if path.suffix.lower() not in IMAGE_SUFFIXES or not path.is_file():
-                continue
-            # DEFAULT_ROOTS overlap on purpose (DCIM/Camera is inside DCIM), so
-            # that a phone which uses either layout works with no configuration.
-            # The cost is that the same file is reachable twice.
-            resolved = path.resolve()
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            try:
-                found.append((path.stat().st_mtime, path))
-            except OSError:
-                continue
+            for name in filenames:
+                if len(found) >= MAX_SCAN:
+                    break
+                if SKIP_HIDDEN and name.startswith("."):
+                    continue
+                path = Path(dirpath, name)
+                if path.suffix.lower() not in IMAGE_SUFFIXES:
+                    continue
+                # One stat for the three things we need — is it a file, how old,
+                # how big — instead of is_file() here and another in describe().
+                # On FUSE-backed /sdcard the syscall is the expensive part.
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if not stat_module.S_ISREG(st.st_mode) or st.st_size < MIN_IMAGE_BYTES:
+                    continue
+                # DEFAULT_ROOTS overlap on purpose (DCIM/Camera is inside DCIM),
+                # so that a phone which uses either layout works with no
+                # configuration. The cost is that the same file is reachable
+                # twice.
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                # A symlink out of the gallery resolves to somewhere admissible()
+                # will refuse, and listing what /photo won't serve is worse than
+                # not listing it: the app shows a photo that 404s on tap.
+                if not resolved.is_relative_to(base):
+                    continue
+                seen.add(resolved)
+                found.append((st.st_mtime, path, st.st_size))
 
     found.sort(key=lambda item: item[0], reverse=True)
-    return [describe(path, mtime) for mtime, path in found]
+    return [describe(path, mtime, size) for mtime, path, size in found]
 
 
-def describe(path: Path, mtime: float) -> dict:
+def admissible(candidate: Path, roots: list[Path]) -> Path | None:
+    """The resolved `candidate` if scan() would have listed it, else None.
+
+    Same predicate as scan(), asked about one path instead of built by walking
+    all of them. Resolving before the containment check is the part that
+    matters: it collapses `..` and follows symlinks, so a path that ends up
+    outside every root cannot talk its way back in."""
+    try:
+        resolved = candidate.expanduser().resolve()
+    except OSError:
+        return None
+
+    for root in roots:
+        try:
+            base = root.expanduser().resolve()
+            relative = resolved.relative_to(base)
+        except (OSError, ValueError):
+            continue  # not under this root
+        if SKIP_HIDDEN and any(part.startswith(".") for part in relative.parts):
+            continue
+        if resolved.suffix.lower() not in IMAGE_SUFFIXES:
+            return None
+        try:
+            st = resolved.stat()
+        except OSError:
+            return None
+        if not stat_module.S_ISREG(st.st_mode) or st.st_size < MIN_IMAGE_BYTES:
+            return None
+        return resolved
+    return None
+
+
+def mime_for(path: Path) -> str:
     mime, _ = mimetypes.guess_type(path.name)
     if path.suffix.lower() in {".heic", ".heif"} and not mime:
         # Not in Python's table on every platform, and the reader needs it to
         # tell the model what it is looking at.
         mime = f"image/{path.suffix.lower().lstrip('.')}"
-    try:
-        size = path.stat().st_size
-    except OSError:
-        size = 0
+    return mime or "application/octet-stream"
+
+
+def describe(path: Path, mtime: float, size: int) -> dict:
     return {
-        # The id is the path, but callers never get to choose one: /photo looks
-        # it up in a fresh listing and serves nothing that isn't in it.
+        # The id is the path. A client can send back any path it likes, so
+        # /photo re-checks it with admissible() rather than trusting this.
         "id": str(path),
         "name": path.name,
-        "mime": mime or "application/octet-stream",
+        "mime": mime_for(path),
         "bytes": size,
         "taken_at": int(mtime * 1000),
     }
@@ -287,12 +367,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if url.path == "/photo":
             wanted = query.get("id", [""])[0]
-            # Resolved against the listing, never used as a path: this is what
-            # makes `id` safe to accept from a client at all.
-            match = next((p for p in scan(self.roots) if p["id"] == wanted), None)
-            if not match:
+            # `id` came from a listing we produced, but it arrives over the wire
+            # and is therefore a client-supplied path — it has to be re-checked
+            # here, not trusted. admissible() applies exactly the rules scan()
+            # applies, containment included, without walking the gallery a
+            # second time to do it: this runs right after /latest.json, and on
+            # FUSE-backed /sdcard that second walk was most of the wait.
+            resolved = admissible(Path(wanted), self.roots)
+            if not resolved:
                 return self._json({"error": "no such photo"}, 404)
-            return self._bytes(Path(match["id"]), match["mime"])
+            return self._bytes(resolved, mime_for(resolved))
 
         self._json(
             {
