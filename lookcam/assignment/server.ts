@@ -131,7 +131,14 @@ type CaptureLog = {
     advice_detail: string;
     cut_off_edges: string[];
     next_target: string;
+    next_target_short: string;
     region: string;
+    partial_observations: Array<{
+        problem_number: string;
+        location: string;
+        line: string;
+        text_latex: string;
+    }>;
     unreadable: string[];
     more_content_beyond: string[];
     changes: string[];
@@ -403,6 +410,8 @@ const RESPONSE_SCHEMA = {
                     items: { type: "string", enum: ["top", "bottom", "left", "right"] },
                 },
                 next_target: { type: "string" },
+                // A second, display-safe form for the two-line glasses HUD.
+                next_target_short: { type: "string" },
                 more_content_beyond: {
                     type: "array",
                     items: { type: "string", enum: ["top", "bottom", "left", "right"] },
@@ -416,6 +425,7 @@ const RESPONSE_SCHEMA = {
                 "region",
                 "edges_seen",
                 "next_target",
+                "next_target_short",
                 "more_content_beyond",
             ],
         },
@@ -445,6 +455,19 @@ const RESPONSE_SCHEMA = {
         changes: { type: "array", items: { type: "string" } },
         confidence: { type: "number" },
         unreadable: { type: "array", items: { type: "string" } },
+        partial_observations: {
+            type: "array",
+            items: {
+                type: "object",
+                properties: {
+                    problem_number: { type: "string" },
+                    location: { type: "string" },
+                    line: { type: "string" },
+                    text_latex: { type: "string" },
+                },
+                required: ["problem_number", "location", "line", "text_latex"],
+            },
+        },
         done: { type: "boolean" },
     },
     required: [
@@ -454,6 +477,7 @@ const RESPONSE_SCHEMA = {
         "changes",
         "confidence",
         "unreadable",
+        "partial_observations",
         "done",
     ],
 };
@@ -467,7 +491,10 @@ actually legible in this frame. A blurry character, cropped line, glare-covered
 word, or tiny unreadable problem is NOT readable. If anything is uncertain,
 omit that problem from assignment.problems and explain exactly what is missing
 in unreadable and next_target. It is better to say "problem 4 final line is
-not visible" than to invent it.
+not visible" than to invent it. However, DO report every legible fragment in
+partial_observations, even when it is only one line or half a line. Record the
+problem number if visible, where it was in the frame (for example "top-right"),
+which line (for example "first line"), and only the exact visible text.
 
 YOUR TWO JOBS
 1. TRANSCRIBE the assignment exactly as written — every problem, in order.
@@ -509,6 +536,12 @@ Return the COMPLETE, UPDATED transcription — not just the new bits:
   next_target. Never return a guessed statement with clear=false as filler.
 - complete means the entire statement is visible and readable; clear means the
   characters themselves are trustworthy.
+- partial_observations is evidence only and is never an assignment problem.
+  Use it for a quarter-page close-up: a single visible line is useful even when
+  the rest of that problem is below the frame.
+- Keep next_target_short to 20 characters or fewer. It must be a compact HUD
+  label such as "Below problem 4" or "Top-right, line 2"; put the full
+  explanation in next_target and advice_detail.
 - List what this frame changed in "changes" (e.g. "added problem 4", "fixed
   exponent in problem 2"). If nothing changed, return an empty array.
 - Set done=true only when every problem you have transcribed is complete and
@@ -529,12 +562,19 @@ type GeminiResult = {
         region: string;
         edges_seen: string[];
         next_target: string;
+        next_target_short: string;
         more_content_beyond: string[];
     };
     assignment: Assignment;
     changes: string[];
     confidence: number;
     unreadable: string[];
+    partial_observations: Array<{
+        problem_number: string;
+        location: string;
+        line: string;
+        text_latex: string;
+    }>;
     done: boolean;
 };
 
@@ -1159,8 +1199,10 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             region: result.framing.region ?? "",
             edges_seen: result.framing.edges_seen ?? [],
             next_target: result.framing.next_target ?? "",
+            next_target_short: result.framing.next_target_short ?? "",
             more_content_beyond: result.framing.more_content_beyond ?? [],
             unreadable: result.unreadable ?? [],
+            partial_observations: result.partial_observations ?? [],
             changes: result.changes ?? [],
             confidence: result.confidence,
             done: result.done,
@@ -1250,8 +1292,10 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             advice_detail: result.framing.advice_detail,
             cut_off_edges: result.framing.cut_off_edges ?? [],
             next_target: result.framing.next_target ?? "",
+            next_target_short: result.framing.next_target_short ?? "",
             region: result.framing.region ?? "",
             unreadable: result.unreadable ?? [],
+            partial_observations: result.partial_observations ?? [],
             more_content_beyond: result.framing.more_content_beyond ?? [],
             // Never advertise a textual change that was rejected by the
             // server-side evidence gate.
@@ -1276,6 +1320,8 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
                 (edge) => !state.edges_seen.includes(edge),
             ),
             next_target: log.next_target,
+            next_target_short: log.next_target_short,
+            partial_observations: log.partial_observations,
             // Problems whose older reading we preferred to this frame's.
             kept: kept.length ? kept : undefined,
             assignment: state.assignment,

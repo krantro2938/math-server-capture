@@ -84,7 +84,12 @@ act on:
     "frame_quality": "good",               //   refocus | reduce_glare | reposition_paper
     "changes": ["added problem 1"],
     "next_target": "Show the lower-right corner, below problem 2.",
+    "next_target_short": "Below problem 2",
     "unreadable": ["problem 3 final line is obscured by glare"],
+    "partial_observations": [{
+      "problem_number": "3", "location": "top-right",
+      "line": "first line", "text_latex": "Find $x$ if $2x=6$."
+    }],
     "changes": [],                           // uncertain text is never committed
     "confidence": 0.91
   },
@@ -98,7 +103,9 @@ The job keeps capturing on its own; `camera_advice` tells *you* how to nudge the
 camera between passes. It also supports `move_slightly_up`,
 `move_slightly_down`, `move_slightly_left`, and `move_slightly_right` for small
 corrections. `next_target`, `unreadable`, `region`, and `more_content_beyond`
-say exactly what the reader can and cannot see.
+say exactly what the reader can and cannot see. `partial_observations` records
+legible fragments by problem, location, and line without promoting them to a
+complete assignment problem.
 
 Unclear frames are feedback-only: blurry, dark, glare-covered, no-paper, or
 low-confidence frames do not change the assignment. Individual problems are
