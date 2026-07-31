@@ -155,15 +155,9 @@ type State = {
     updated_at: string;
     capture_count: number;
     done: boolean; // model thinks the assignment is fully captured
-    /**
-     * Whether ANY frame in this attempt has shown the whole sheet.
-     *
-     * The gate on `done`. Every other signal is about the problems we have; this
-     * is the only one that says anything about problems we might not — a model
-     * looking at the top two thirds of a page can call what it sees complete
-     * and be perfectly right and still be missing problem 25.
-     */
+    /** Whether any one frame showed the whole sheet; retained for diagnostics. */
     full_page_seen: boolean;
+    /** Cumulative paper edges seen across all readable captures. */
     edges_seen: string[];
     assignment: Assignment;
     captures: CaptureLog[];
@@ -517,8 +511,11 @@ Return the COMPLETE, UPDATED transcription — not just the new bits:
   characters themselves are trustworthy.
 - List what this frame changed in "changes" (e.g. "added problem 4", "fixed
   exponent in problem 2"). If nothing changed, return an empty array.
-- Set done=true only when every problem is complete and the whole sheet has
-  been seen.
+- Set done=true only when every problem you have transcribed is complete and
+  all four paper edges have been seen across the sequence of frames. The whole
+  page does NOT need to fit in one frame: the operator may scan top, middle,
+  and bottom sections. If any edge or problem may still be missing, keep
+  done=false and identify the next section in next_target.
 ${note ? `\nOPERATOR NOTE FOR THIS FRAME: ${note}\n` : ""}`;
 }
 
@@ -1217,16 +1214,17 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
         // and the only sign is a solution that answers fewer problems than the
         // paper has.
         //
-        // So finishing needs all three: the model says so, every problem we hold
-        // is complete, and at some point this attempt has seen the whole sheet
-        // in one frame. If the camera never shows the whole page the job never
-        // self-completes, which is correct — it hasn't read the whole page —
-        // and max_captures still bounds the cost while the glasses say which way
-        // to move the camera.
+        // Finishing is cumulative: the model must say so, every problem we hold
+        // must be complete, and all four paper edges must have been observed
+        // across the attempt. The camera can therefore read a close-up section
+        // at a time; no single frame has to contain the entire sheet.
         const problems = state.assignment.problems ?? [];
         const allComplete = problems.length > 0 && problems.every((p) => p.complete);
+        const coverageComplete = ["top", "bottom", "left", "right"].every((edge) =>
+            state.edges_seen.includes(edge),
+        );
         state.done =
-            Boolean(result.done) && usable && allComplete && state.full_page_seen;
+            Boolean(result.done) && usable && allComplete && coverageComplete;
 
         if (result.done && !state.done) {
             emit("done_rejected", {
@@ -1234,7 +1232,7 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
                     ? "frame is not clear enough to accept transcription"
                     : !allComplete
                       ? "not every problem is complete"
-                      : "the whole sheet has never been in frame",
+                      : "not all four paper edges have been seen across the scan",
                 problems: problems.length,
                 problems_complete: completeCount(),
                 full_page_seen: state.full_page_seen,
