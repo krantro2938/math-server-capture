@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------- secrets ---
+# Anything holding a real password. The *.example / committed *.env templates
+# stay tracked: `.env` matches only the exact filename, and config.env is
+# deliberately not covered by these patterns.
+.env
+config.local.env
+web/.env
+
+# ------------------------------------------------------------ big binaries ---
+# Reverse-engineering inputs. Kept locally, never committed — the APK alone is
+# 74 MB (past GitHub's 50 MB warning) and the pcap contains the camera's live
+# traffic, password included. Re-fetch the APK from APKPure; re-capture the pcap
+# with PCAPdroid if ever needed. What they taught us is written up in README.md.
+*.apk
+*.pcap
+*.pcapng
+*.dex
+*.so
+
+# Decompiler / analysis output (jadx, Ghidra, scratch dumps)
+jadxout/
+scratchpad/
+*.gpr
+*.rep
+
+# --------------------------------------------------------- captured video ---
+# Stream dumps and recordings — regenerated on every run, and large.
+*.h264
+*.h265
+*.hevc
+*.mp4
+*.m3u8
+*.m4s
+recordings/
+vps/docker/recordings/
+
+# Assignment reader's runtime state: state.json, the last frame, and the
+# archive of previous versions. Regenerated on every run.
+assignment/data/
+# NB: no bare `*.ts` here, however tempting for MPEG-TS dumps — it also matches
+# TypeScript, and would silently drop web/server.ts from the repo (it did once).
+# MPEG-TS only ever lands in the ignored recordings/ dirs anyway.
+
+# ------------------------------------------------------------------- logs ---
+*.log
+session-*.log
+
+# ----------------------------------------------------------------- python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ------------------------------------------------------------------- node ---
+node_modules/
+
+# ------------------------------------------------------- editors / OS junk ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

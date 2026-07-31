@@ -1,0 +1,82 @@
+# MediaMTX config for the LookCam bridge.
+# Receives the phone's push (RTMP or SRT), records to disk in segments, and
+# re-serves the live stream as RTSP / HLS / WebRTC so you can watch it remotely.
+#
+# Run:  ./mediamtx mediamtx.yml
+# Docs: https://github.com/bluenviron/mediamtx
+
+###############################################################################
+# Servers (ingest + playback)
+###############################################################################
+rtmp: yes
+rtmpAddress: :1935          # phone pushes here (USE_SRT=no)
+
+srt: yes
+srtAddress: :8890           # phone pushes here (USE_SRT=yes) — survives packet loss
+
+# Viewing surfaces are bound to localhost — the web/ gateway proxies them, so
+# they need NOT be exposed publicly. Only 1935 (RTMP) and 8890 (SRT) ingest
+# stay public. Un-localhost any of these if you also want to reach them directly.
+rtsp: yes
+rtspAddress: 127.0.0.1:8554        # pull:  rtsp://viewer:pass@127.0.0.1:8554/cam1
+hls: yes
+hlsAddress: 127.0.0.1:8888         # the gateway reads live HLS here
+hlsVariant: lowLatency             # LL-HLS: ~2-3s instead of ~5-6s
+hlsSegmentDuration: 1s
+# 133ms == 2 frames at 15fps, and that exactness is the point. gohlslib does NOT
+# use this value directly: to satisfy an iOS rule ("part durations must be >=85%
+# of PART-TARGET") it rounds up in 5ms steps until the value is compatible with
+# the sample duration. At 15fps a sample is 66.667ms, so the old 200ms was
+# rounded up to 230ms and parts ended up holding FOUR frames = 267ms — a third
+# more than configured. PART-HOLD-BACK is 2.5x that, so the client was told to
+# stay 667ms back. 133ms lands on 2 frames exactly: PART-TARGET 133ms,
+# hold-back ~333ms. Re-check this if FPS ever changes.
+hlsPartDuration: 133ms
+hlsSegmentCount: 30                # ~30s of scrub-back in the Live tab (full
+                                   # history lives in recordings, via the DVR tab)
+webrtc: no                         # off for now (needs public UDP+ICE); HLS covers live
+
+# Playback server — powers the "scrub back to any time" recordings UI.
+playback: yes
+playbackAddress: 127.0.0.1:9996    # the gateway queries /list and /get here
+
+###############################################################################
+# Auth — do NOT leave a camera stream open on a public VPS.
+# Change both passwords. No anonymous access is granted.
+###############################################################################
+authInternalUsers:
+  - user: publisher
+    pass: CHANGE_ME_PUBLISH          # must match PUBLISH_PASS in run/capture.sh
+    ips: []
+    permissions:
+      - action: publish              # any path: cam1 (h264 mode) or cam1_hevc (copy mode)
+  - user: viewer
+    pass: CHANGE_ME_VIEW             # use this to watch RTSP/HLS/WebRTC
+    ips: []
+    permissions:
+      - action: read                 # cam1 for the frontend; cam1_hevc for transcode.sh
+      - action: playback             # needed for the DVR playback API
+
+###############################################################################
+# Recording defaults (segmented files for storage + later parsing)
+###############################################################################
+pathDefaults:
+  record: no
+
+paths:
+  cam1:
+    # The browser-ready H.264 stream (h264 mode publishes here directly;
+    # copy mode has vps/transcode.sh publish here from cam1_hevc).
+    # 15-minute fragmented-MP4 segments; fmp4 tolerates abrupt cuts well.
+    record: yes
+    recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    recordSegmentDuration: 900s
+    recordDeleteAfter: 24h           # auto-purge after 1 day; set 0 to keep forever
+                                     # 1080p15 fmp4 runs ~800 MB/h, so a day is
+                                     # ~19 GB — already most of a 30 GB disk.
+
+  # Raw H.265 source, only used in copy mode (weak capture box). Not recorded
+  # here; vps/transcode.sh reads it and republishes cam1 as H.264.
+  cam1_hevc:
+    record: no
