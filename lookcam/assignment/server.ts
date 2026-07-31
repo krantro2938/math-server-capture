@@ -109,6 +109,15 @@ type Problem = {
     clear?: boolean;
     confidence?: number;
 };
+type Observation = {
+    problem_number: string;
+    line_key: string;
+    span: "start" | "middle" | "end" | "whole";
+    location: string;
+    text_latex: string;
+    confidence: number;
+    clear: boolean;
+};
 type Assignment = {
     title: string;
     subject: string;
@@ -133,12 +142,7 @@ type CaptureLog = {
     next_target: string;
     next_target_short: string;
     region: string;
-    partial_observations: Array<{
-        problem_number: string;
-        location: string;
-        line: string;
-        text_latex: string;
-    }>;
+    observations: Observation[];
     unreadable: string[];
     more_content_beyond: string[];
     changes: string[];
@@ -166,6 +170,8 @@ type State = {
     full_page_seen: boolean;
     /** Cumulative paper edges seen across all readable captures. */
     edges_seen: string[];
+    /** Persistent exact fragments, keyed by problem + line_key. */
+    observations: Observation[];
     assignment: Assignment;
     captures: CaptureLog[];
     job: Job;
@@ -197,6 +203,7 @@ const newState = (version: number): State => ({
     done: false,
     full_page_seen: false,
     edges_seen: [],
+    observations: [],
     assignment: emptyAssignment(),
     captures: [],
     job: idleJob(),
@@ -221,6 +228,9 @@ function loadState(): State {
             loaded.full_page_seen = Boolean(loaded.full_page_seen); // ditto
             loaded.edges_seen = Array.isArray(loaded.edges_seen)
                 ? loaded.edges_seen.map(String)
+                : [];
+            loaded.observations = Array.isArray(loaded.observations)
+                ? loaded.observations
                 : [];
             return loaded;
         }
@@ -455,17 +465,28 @@ const RESPONSE_SCHEMA = {
         changes: { type: "array", items: { type: "string" } },
         confidence: { type: "number" },
         unreadable: { type: "array", items: { type: "string" } },
-        partial_observations: {
+        observations: {
             type: "array",
             items: {
                 type: "object",
                 properties: {
                     problem_number: { type: "string" },
+                    line_key: { type: "string" },
+                    span: { type: "string", enum: ["start", "middle", "end", "whole"] },
                     location: { type: "string" },
-                    line: { type: "string" },
                     text_latex: { type: "string" },
+                    confidence: { type: "number" },
+                    clear: { type: "boolean" },
                 },
-                required: ["problem_number", "location", "line", "text_latex"],
+                required: [
+                    "problem_number",
+                    "line_key",
+                    "span",
+                    "location",
+                    "text_latex",
+                    "confidence",
+                    "clear",
+                ],
             },
         },
         done: { type: "boolean" },
@@ -477,13 +498,14 @@ const RESPONSE_SCHEMA = {
         "changes",
         "confidence",
         "unreadable",
-        "partial_observations",
+        "observations",
         "done",
     ],
 };
 
 function buildPrompt(note: string): string {
     const soFar = JSON.stringify(state.assignment, null, 2);
+    const evidenceSoFar = JSON.stringify(state.observations, null, 2);
     return `You are reading a school assignment from a single frame of a ceiling-mounted camera pointed at a sheet of paper on a desk.
 
 EVIDENCE-ONLY RULE: NEVER GUESS, COMPLETE, OR RECONSTRUCT text that is not
@@ -492,9 +514,11 @@ word, or tiny unreadable problem is NOT readable. If anything is uncertain,
 omit that problem from assignment.problems and explain exactly what is missing
 in unreadable and next_target. It is better to say "problem 4 final line is
 not visible" than to invent it. However, DO report every legible fragment in
-partial_observations, even when it is only one line or half a line. Record the
-problem number if visible, where it was in the frame (for example "top-right"),
-which line (for example "first line"), and only the exact visible text.
+observations, even when it is only a few words or half a line. This is a
+persistent evidence store: use a stable line_key such as "line-1" or
+"line-2", set span to start/middle/end/whole, record where it was in the frame,
+and include only the exact visible text. Later frames may edit the same
+line_key with a clearer or longer fragment.
 
 YOUR TWO JOBS
 1. TRANSCRIBE the assignment exactly as written — every problem, in order.
@@ -525,6 +549,11 @@ so far (JSON):
 
 ${soFar}
 
+Persistent exact line evidence from earlier close-ups (you may improve a matching
+line_key, but do not erase evidence just because it is outside this frame):
+
+${evidenceSoFar}
+
 Return the COMPLETE, UPDATED transcription — not just the new bits:
 - Keep everything already correct; do not drop problems you can no longer see.
 - Fix mistakes and fill in parts that were previously cut off or unreadable.
@@ -536,9 +565,10 @@ Return the COMPLETE, UPDATED transcription — not just the new bits:
   next_target. Never return a guessed statement with clear=false as filler.
 - complete means the entire statement is visible and readable; clear means the
   characters themselves are trustworthy.
-- partial_observations is evidence only and is never an assignment problem.
-  Use it for a quarter-page close-up: a single visible line is useful even when
-  the rest of that problem is below the frame.
+- observations is evidence only and is never an assignment problem. Use it for
+  a quarter-page close-up: a few visible words are useful even when the rest of
+  that problem is below the frame. Never fill missing characters with guesses
+  or ellipses.
 - Keep next_target_short to 20 characters or fewer. It must be a compact HUD
   label such as "Below problem 4" or "Top-right, line 2"; put the full
   explanation in next_target and advice_detail.
@@ -569,12 +599,7 @@ type GeminiResult = {
     changes: string[];
     confidence: number;
     unreadable: string[];
-    partial_observations: Array<{
-        problem_number: string;
-        location: string;
-        line: string;
-        text_latex: string;
-    }>;
+    observations: Observation[];
     done: boolean;
 };
 
@@ -1085,6 +1110,39 @@ function mergeAssignment(
     };
 }
 
+/**
+ * Persist exact line fragments independently of the final assignment.
+ * A later close-up can replace the same line_key with a longer/clearer span;
+ * moving the camera to another part of the page cannot erase earlier evidence.
+ */
+function mergeObservations(
+    prev: Observation[],
+    next: Observation[],
+): Observation[] {
+    const minConfidence = Number(process.env.MIN_OBSERVATION_CONFIDENCE ?? 0.65);
+    const byKey = new Map<string, Observation>();
+    for (const observation of prev ?? []) {
+        byKey.set(`${observation.problem_number}:${observation.line_key}`, observation);
+    }
+    for (const observation of next ?? []) {
+        if (
+            observation.clear !== true ||
+            Number(observation.confidence ?? 0) < minConfidence ||
+            observation.text_latex.trim().length < 1
+        ) continue;
+        const key = `${observation.problem_number}:${observation.line_key}`;
+        const old = byKey.get(key);
+        // Keep the clearer/longer evidence when two close-ups overlap.
+        if (
+            !old ||
+            observation.confidence > old.confidence ||
+            (observation.confidence === old.confidence &&
+                observation.text_latex.length > old.text_latex.length)
+        ) byKey.set(key, observation);
+    }
+    return [...byKey.values()];
+}
+
 /** What Gemini accepts inline, and therefore what POST /photo accepts. */
 const GEMINI_IMAGE_TYPES = [
     "image/jpeg",
@@ -1202,7 +1260,7 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             next_target_short: result.framing.next_target_short ?? "",
             more_content_beyond: result.framing.more_content_beyond ?? [],
             unreadable: result.unreadable ?? [],
-            partial_observations: result.partial_observations ?? [],
+            observations: result.observations ?? [],
             changes: result.changes ?? [],
             confidence: result.confidence,
             done: result.done,
@@ -1237,6 +1295,7 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             const merge = mergeAssignment(state.assignment, result.assignment);
             state.assignment = merge.merged;
             kept = merge.kept;
+            state.observations = mergeObservations(state.observations, result.observations);
         }
 
         if (result.framing.full_page_visible) state.full_page_seen = true;
@@ -1295,7 +1354,7 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             next_target_short: result.framing.next_target_short ?? "",
             region: result.framing.region ?? "",
             unreadable: result.unreadable ?? [],
-            partial_observations: result.partial_observations ?? [],
+            observations: result.observations ?? [],
             more_content_beyond: result.framing.more_content_beyond ?? [],
             // Never advertise a textual change that was rejected by the
             // server-side evidence gate.
@@ -1321,7 +1380,7 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             ),
             next_target: log.next_target,
             next_target_short: log.next_target_short,
-            partial_observations: log.partial_observations,
+            observations: state.observations,
             // Problems whose older reading we preferred to this frame's.
             kept: kept.length ? kept : undefined,
             assignment: state.assignment,
