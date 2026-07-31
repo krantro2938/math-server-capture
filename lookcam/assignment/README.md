@@ -28,6 +28,9 @@ POST /start ─┐
 | `POST` | `/stop` | Stop the running job (idempotent, takes effect immediately) |
 | `GET` | `/events` | **SSE feed** — live progress while the job works (see below) |
 | `POST` | `/capture` | One single capture, no job. For a manual check or to debug framing. Optional body `{"note":"..."}` |
+| `POST` | `/batch/start` | Start manual snapshot mode; no model calls yet. Optional `{"note":"...", "max_snapshots":20}` |
+| `POST` | `/batch/snapshot` | Save the camera's current JPEG into the active batch. |
+| `POST` | `/batch/finish` | Send every saved snapshot to the model together and build one assignment. |
 | `POST` | `/photo` | **Read a PHOTO instead of the camera.** The request body IS the image (`image/jpeg\|png\|webp\|heic\|heif`). Resets first — a photo is a different sheet, and merging it into the transcription the camera has been building would interleave two assignments. `?reset=0` opts out, `?note=` passes a note |
 | `GET` | `/assignment` | The assignment as JSON — the thing you're after |
 | `GET` | `/assignment.md` | Same, rendered as Markdown + LaTeX |
@@ -115,6 +118,22 @@ least `MIN_PROBLEM_CONFIDENCE` (default `0.85`). The whole frame must have
 confidence at least `MIN_FRAME_CONFIDENCE` (default `0.80`) and be marked
 `good`. These thresholds can be overridden in the environment, but lowering
 them trades away the anti-hallucination guarantee.
+
+### Manual snapshot mode
+
+Use this when you want to control the camera position yourself. Start a batch,
+take one snapshot for each useful view, then finish it:
+
+```bash
+curl -X POST -H "X-API-Token: $TOKEN" http://127.0.0.1:8091/batch/start
+curl -X POST -H "X-API-Token: $TOKEN" http://127.0.0.1:8091/batch/snapshot
+curl -X POST -H "X-API-Token: $TOKEN" http://127.0.0.1:8091/batch/snapshot
+curl -X POST -H "X-API-Token: $TOKEN" http://127.0.0.1:8091/batch/finish
+```
+
+Snapshots cost no model calls. Finishing sends them as multiple image parts in
+one model request, allowing the AI to compare overlapping views and use a
+clearer close-up to complete an earlier line.
 
 ## Live feedback: `GET /events`
 

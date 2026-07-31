@@ -93,12 +93,15 @@ const cfg = {
     autoResume: (process.env.AUTO_RESUME ?? "1") !== "0",
 
     dataDir: process.env.DATA_DIR ?? "./data",
+    maxBatchSnapshots: Number(process.env.MAX_BATCH_SNAPSHOTS ?? 40),
+    maxBatchBytes: Number(process.env.MAX_BATCH_BYTES ?? 12_000_000),
 };
 
 const STATE_FILE = join(cfg.dataDir, "state.json");
 const ASSIGNMENT_FILE = join(cfg.dataDir, "assignment.json"); // clean copy, for humans/scripts
 const FRAME_FILE = join(cfg.dataDir, "last-frame.jpg");
 const ARCHIVE_DIR = join(cfg.dataDir, "archive");
+const BATCH_DIR = join(cfg.dataDir, "batches");
 
 // ---------------------------------------------------------------- state -----
 
@@ -159,6 +162,16 @@ type Job = {
     note: string;
     consecutive_failures: number;
 };
+type Batch = {
+    active: boolean;
+    processing: boolean;
+    started_at: string | null;
+    finished_at: string | null;
+    snapshot_count: number;
+    max_snapshots: number;
+    note: string;
+    error: string | null;
+};
 
 type State = {
     version: number; // bumps on every /reset — "one version of the assignment"
@@ -175,6 +188,7 @@ type State = {
     assignment: Assignment;
     captures: CaptureLog[];
     job: Job;
+    batch: Batch;
 };
 
 const idleJob = (): Job => ({
@@ -186,6 +200,16 @@ const idleJob = (): Job => ({
     max_captures: cfg.maxCaptures,
     note: "",
     consecutive_failures: 0,
+});
+const idleBatch = (): Batch => ({
+    active: false,
+    processing: false,
+    started_at: null,
+    finished_at: null,
+    snapshot_count: 0,
+    max_snapshots: cfg.maxBatchSnapshots,
+    note: "",
+    error: null,
 });
 
 const emptyAssignment = (): Assignment => ({
@@ -207,6 +231,7 @@ const newState = (version: number): State => ({
     assignment: emptyAssignment(),
     captures: [],
     job: idleJob(),
+    batch: idleBatch(),
 });
 
 /** Write via temp file + rename: a crash mid-write can't leave a half-written
@@ -225,6 +250,7 @@ function loadState(): State {
                 readFileSync(STATE_FILE, "utf8"),
             ) as State;
             loaded.job = { ...idleJob(), ...(loaded.job ?? {}) }; // state.json from an older build
+            loaded.batch = { ...idleBatch(), ...(loaded.batch ?? {}) };
             loaded.full_page_seen = Boolean(loaded.full_page_seen); // ditto
             loaded.edges_seen = Array.isArray(loaded.edges_seen)
                 ? loaded.edges_seen.map(String)
@@ -676,7 +702,7 @@ function nextRung(err: any, chain: Attempt[], i: number): number {
  *  gets transcribed, so without this the only trace of Google being down is a
  *  line in the log nobody is watching. */
 async function readFrame(
-    jpeg: Buffer,
+    jpeg: Buffer | Buffer[],
     note: string,
     mime = "image/jpeg",
 ): Promise<{ result: GeminiResult; used: Attempt }> {
@@ -723,7 +749,7 @@ async function readFrame(
 
 async function callGemini(
     model: string,
-    jpeg: Buffer,
+    jpeg: Buffer | Buffer[],
     note: string,
     // Camera frames are always JPEG; an uploaded photo is whatever the phone's
     // gallery holds, and Gemini needs to be told which. Sending image/jpeg for
@@ -731,6 +757,7 @@ async function callGemini(
     // actually needed, long after this was written.
     mime = "image/jpeg",
 ): Promise<GeminiResult> {
+    const images = Array.isArray(jpeg) ? jpeg : [jpeg];
     const url = `${cfg.geminiBase}/v1beta/models/${model}:generateContent`;
     const res = await fetch(url, {
         method: "POST",
@@ -743,12 +770,9 @@ async function callGemini(
                 {
                     role: "user",
                     parts: [
-                        {
-                            inline_data: {
-                                mime_type: mime,
-                                data: jpeg.toString("base64"),
-                            },
-                        },
+                        ...images.map((image) => ({
+                            inline_data: { mime_type: mime, data: image.toString("base64") },
+                        })),
                         { text: buildPrompt(note) },
                     ],
                 },
@@ -831,10 +855,11 @@ function strictJsonSchema(node: any): any {
  */
 async function callMistral(
     model: string,
-    jpeg: Buffer,
+    jpeg: Buffer | Buffer[],
     note: string,
     mime = "image/jpeg",
 ): Promise<GeminiResult> {
+    const images = Array.isArray(jpeg) ? jpeg : [jpeg];
     const res = await fetch(`${cfg.mistralBase}/v1/chat/completions`, {
         method: "POST",
         headers: {
@@ -848,12 +873,10 @@ async function callMistral(
                 {
                     role: "user",
                     content: [
-                        {
+                        ...images.map((image) => ({
                             type: "image_url",
-                            image_url: {
-                                url: `data:${mime};base64,${jpeg.toString("base64")}`,
-                            },
-                        },
+                            image_url: { url: `data:${mime};base64,${image.toString("base64")}` },
+                        })),
                         { type: "text", text: buildPrompt(note) },
                     ],
                 },
@@ -964,6 +987,7 @@ const snapshot = () => ({
     done: state.done,
     capturing,
     job: state.job,
+    batch: state.batch,
     problems: state.assignment.problems?.length ?? 0,
     // How much of what we have is finished, and whether the sheet has ever been
     // fully in frame. Together these are "how far along is this really", which
@@ -1209,7 +1233,11 @@ let capturing = false;
  *        merge, the same events, so a photographed sheet and a captured one are
  *        the same kind of thing to every consumer downstream.
  */
-async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
+async function doCapture(
+    note: string,
+    supplied?: Buffer | Buffer[],
+    mime = "image/jpeg",
+) {
     if (capturing)
         throw Object.assign(new Error("a capture is already in progress"), {
             status: 409,
@@ -1221,17 +1249,25 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
         emit("capture_started", {
             n: state.capture_count + 1,
             note: note || null,
-            source: supplied ? "upload" : "camera",
+            source: supplied ? (Array.isArray(supplied) ? "batch" : "upload") : "camera",
         });
 
-        const jpeg = supplied ?? (await grabFrame());
+        const frames = supplied
+            ? (Array.isArray(supplied) ? supplied : [supplied])
+            : [await grabFrame()];
+        const jpeg = frames.at(-1)!;
         // Written even for an upload: /frame.jpg is "the frame the last capture
         // read", and after this one that is the photo.
         writeAtomic(FRAME_FILE, jpeg);
         emit("frame_grabbed", {
-            bytes: jpeg.length,
+            bytes: frames.reduce((sum, frame) => sum + frame.length, 0),
+            frames: frames.length,
             ms: Date.now() - startedAt,
-            source: supplied ? "upload" : cfg.snapshotUrl ? "gateway" : "rtsp",
+            source: supplied
+                ? (Array.isArray(supplied) ? "batch" : "upload")
+                : cfg.snapshotUrl
+                  ? "gateway"
+                  : "rtsp",
         });
 
         // The reader actually used may end up being a fallback — a
@@ -1244,7 +1280,7 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
             chain: chain.map((a) => `${a.provider}/${a.model}`),
         });
         const modelStart = Date.now();
-        const { result, used } = await readFrame(jpeg, note, mime);
+        const { result, used } = await readFrame(frames, note, mime);
         emit("model_response", {
             ms: Date.now() - modelStart,
             provider: used.provider,
@@ -1405,6 +1441,86 @@ async function doCapture(note: string, supplied?: Buffer, mime = "image/jpeg") {
         throw e;
     } finally {
         capturing = false;
+    }
+}
+
+// ---------------------------------------------------------- manual batches ----
+
+function batchFolder(): string {
+    return join(BATCH_DIR, `v${state.version}`);
+}
+
+function startBatch(note: string, maxSnapshots: number): Batch {
+    if (state.job.running) throw Object.assign(new Error("a live scan is running"), { status: 409 });
+    if (capturing || state.batch.active || state.batch.processing) {
+        throw Object.assign(new Error("a snapshot batch is already active"), { status: 409 });
+    }
+    resetAssignment();
+    state.batch = {
+        ...idleBatch(),
+        active: true,
+        started_at: new Date().toISOString(),
+        max_snapshots: Math.max(1, Math.min(maxSnapshots, cfg.maxBatchSnapshots)),
+        note,
+    };
+    mkdirSync(batchFolder(), { recursive: true });
+    saveState();
+    emit("batch_started", { batch: state.batch });
+    return state.batch;
+}
+
+async function takeBatchSnapshot(): Promise<Batch> {
+    if (!state.batch.active || state.batch.processing) {
+        throw Object.assign(new Error("no snapshot batch is active"), { status: 409 });
+    }
+    if (state.batch.snapshot_count >= state.batch.max_snapshots) {
+        throw Object.assign(new Error("snapshot batch limit reached"), { status: 409 });
+    }
+    const frame = await grabFrame();
+    const n = state.batch.snapshot_count + 1;
+    const path = join(batchFolder(), `frame-${String(n).padStart(4, "0")}.jpg`);
+    writeAtomic(path, frame);
+    state.batch.snapshot_count = n;
+    saveState();
+    emit("batch_snapshot", {
+        n,
+        bytes: frame.length,
+        max_snapshots: state.batch.max_snapshots,
+    });
+    return state.batch;
+}
+
+async function processBatch(): Promise<void> {
+    const version = state.version;
+    const folder = batchFolder();
+    const count = state.batch.snapshot_count;
+    const note = state.batch.note;
+    const files = Array.from({ length: count }, (_, i) =>
+        join(folder, `frame-${String(i + 1).padStart(4, "0")}.jpg`),
+    ).filter(existsSync);
+    state.batch.active = false;
+    state.batch.processing = true;
+    state.batch.finished_at = null;
+    saveState();
+    emit("batch_processing", { snapshots: files.length });
+    try {
+        if (state.version !== version || !files.length) throw new Error("snapshot batch is empty");
+        const frames = files.map((file) => readFileSync(file));
+        const totalBytes = frames.reduce((sum, frame) => sum + frame.length, 0);
+        if (totalBytes > cfg.maxBatchBytes) {
+            throw new Error(`snapshot batch is ${(totalBytes / 1e6).toFixed(1)}MB; limit is ${(cfg.maxBatchBytes / 1e6).toFixed(1)}MB`);
+        }
+        await doCapture(note, frames);
+        state.batch.processing = false;
+        state.batch.finished_at = new Date().toISOString();
+        saveState();
+        emit("batch_finished", { batch: state.batch, done: state.done });
+    } catch (error) {
+        state.batch.processing = false;
+        state.batch.error = String((error as Error)?.message ?? error);
+        state.batch.finished_at = new Date().toISOString();
+        saveState();
+        emit("batch_failed", { error: state.batch.error });
     }
 }
 
@@ -1838,6 +1954,44 @@ const server = Bun.serve({
                 { ok: true, started: true, job, watch: "/events" },
                 202,
             );
+        }
+
+        // Manual multi-snapshot mode. Starting a batch creates a fresh attempt;
+        // snapshots only grab JPEGs and cost no model calls. Finish sends every
+        // stored image to the model together as one reading.
+        if (path === "/batch/start" && req.method === "POST") {
+            let body: any = {};
+            try { body = (await req.json()) ?? {}; } catch { /* empty body */ }
+            try {
+                const batch = startBatch(
+                    typeof body.note === "string" ? body.note : "",
+                    Number.isFinite(body.max_snapshots)
+                        ? Number(body.max_snapshots)
+                        : cfg.maxBatchSnapshots,
+                );
+                return json({ ok: true, batch }, 202);
+            } catch (e: any) {
+                return json({ ok: false, error: String(e?.message ?? e) }, e?.status ?? 409);
+            }
+        }
+
+        if (path === "/batch/snapshot" && req.method === "POST") {
+            try {
+                return json({ ok: true, batch: await takeBatchSnapshot() });
+            } catch (e: any) {
+                return json({ ok: false, error: String(e?.message ?? e) }, e?.status ?? 502);
+            }
+        }
+
+        if (path === "/batch/finish" && req.method === "POST") {
+            if (!state.batch.active) {
+                return json({ ok: false, error: "no snapshot batch is active" }, 409);
+            }
+            if (!state.batch.snapshot_count) {
+                return json({ ok: false, error: "take at least one snapshot first" }, 400);
+            }
+            void processBatch();
+            return json({ ok: true, processing: true, batch: state.batch }, 202);
         }
 
         // Stop the background job. Idempotent.
