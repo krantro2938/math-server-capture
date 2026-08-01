@@ -291,6 +291,51 @@ function downloadName(url: URL, mime: string): string {
 const INDEX = await Bun.file(new URL("./index.html", import.meta.url)).text();
 const LOGIN = await Bun.file(new URL("./login.html", import.meta.url)).text();
 
+// The two standalone Claude prompts, served to the Prompts tab. They used to be
+// a pair of hand-escaped string literals in index.html, copied from the .md
+// files by hand — which is exactly how evens/routine/solve.md came to be a
+// generation behind the prompt actually in use. One copy now: prompts/*.md is
+// the source, this reads it, the tab fetches it.
+//
+// `## Prompt` is the extraction contract, the same one routine/render-prompt.sh
+// uses: everything after that heading is the prompt, everything above it is
+// commentary for whoever opens the file. Read once at startup like INDEX, so a
+// change needs a restart (not a rebuild — web/ is bind-mounted into /app).
+//
+// A bad prompt file must NOT be fatal. This process also serves the live feed
+// and the DVR, and a missing heading in a markdown file is no reason for the
+// camera page to crash-loop — so each prompt fails on its own, loudly in the
+// log, and its card shows the reason instead of stale or wrong text.
+async function promptSection(file: string): Promise<string> {
+  const md = await Bun.file(new URL(`./prompts/${file}`, import.meta.url)).text();
+  const m = md.match(/^## Prompt$/m);
+  if (!m || m.index === undefined) {
+    throw new Error(`no '## Prompt' heading — the tab would otherwise show commentary`);
+  }
+  const body = md.slice(m.index + m[0].length).replace(/^\s*\n/, "").trimEnd();
+  if (!body) throw new Error(`the '## Prompt' section is empty`);
+  return body + "\n";
+}
+
+const PROMPT_FILES = {
+  solve: "solve-assignment-prompt.md",
+  extract: "extract-assignment-prompt.md",
+} as const;
+
+const PROMPTS: Record<string, string> = Object.fromEntries(
+  await Promise.all(
+    Object.entries(PROMPT_FILES).map(async ([key, file]) => {
+      try {
+        return [key, await promptSection(file)];
+      } catch (e: any) {
+        const why = `prompts/${file}: ${e?.message ?? e}`;
+        console.error(`[prompts] ${why}`);
+        return [key, `This prompt could not be loaded.\n\n${why}\n`];
+      }
+    }),
+  ),
+);
+
 Bun.serve({
   port: CFG.port,
 
@@ -374,6 +419,14 @@ Bun.serve({
 
     // --- authenticated routes ---
     if (path === "/") return new Response(INDEX, { headers: html });
+
+    // The Prompts tab's text. Session-gated like everything else here, and
+    // no-store so a restart after editing prompts/*.md is actually visible.
+    if (path === "/api/prompts") {
+      return new Response(JSON.stringify(PROMPTS), {
+        headers: { ...json, "cache-control": "no-store" },
+      });
+    }
 
     if (path.startsWith("/live/")) return proxyHls(path.slice("/live/".length) + url.search);
 
