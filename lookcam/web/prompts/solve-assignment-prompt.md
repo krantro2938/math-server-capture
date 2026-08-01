@@ -15,8 +15,15 @@ the heading exactly where it is.
 
 The one copy that is **not** derived from this file is the live routine at
 <https://claude.ai/code/routines> (`evens-solve-assignment`,
-`trig_01A5uMambmbqEmjvu6pJTHF7`), which stores its prompt as a literal string
-and has to be updated by hand in that UI. `evens/routine/solve.md` carries the
+`trig_01A5uMambmbqEmjvu6pJTHF7`), which stores its prompt as a literal string.
+It does **not** have to be updated by hand in that UI: the routines API takes a
+partial update, so pushing a new prompt is a `POST` to
+`/v1/code/triggers/trig_01A5uMambmbqEmjvu6pJTHF7` with a `job_config` body
+carrying `render-prompt.sh`'s output as `events[0].data.message.content` —
+Claude Code can do this directly via the `schedule` skill's `RemoteTrigger`
+tool, which handles the OAuth in-process. Send the whole `job_config` (it is
+replaced wholesale, unlike the top-level fields) and leave `mcp_connections`
+out so the connector survives. `evens/routine/solve.md` carries the
 same solving rules wrapped in the claim/submit plumbing — those two were
 allowed to drift once (the grader section lived here and in the routine but was
 never committed back to `solve.md`) and were reunited on 2026-08-01. Change one,
