@@ -37,6 +37,7 @@ import {
     readdirSync,
     writeFileSync,
     renameSync,
+    rmSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 
@@ -1490,6 +1491,31 @@ async function takeBatchSnapshot(): Promise<Batch> {
     return state.batch;
 }
 
+/**
+ * Walk away from a batch without spending a model call.
+ *
+ * The frames go with it: they are only ever read as one batch, so keeping them
+ * would leave the next reading of this version silently carrying pictures the
+ * operator already threw away. The version is NOT bumped — `start` did that,
+ * and a cancel should leave the sheet exactly as blank as it found it.
+ *
+ * Idempotent, because the thing you press it from is a menu on a pair of
+ * glasses several hops from this state: "there was nothing to cancel" and "the
+ * cancel worked" want the same answer.
+ */
+function cancelBatch(): Batch {
+    if (state.batch.processing) {
+        throw Object.assign(new Error("the batch is already being read"), { status: 409 });
+    }
+    if (state.batch.active) {
+        rmSync(batchFolder(), { recursive: true, force: true });
+    }
+    state.batch = idleBatch();
+    saveState();
+    emit("batch_cancelled", { batch: state.batch });
+    return state.batch;
+}
+
 async function processBatch(): Promise<void> {
     const version = state.version;
     const folder = batchFolder();
@@ -1980,6 +2006,14 @@ const server = Bun.serve({
                 return json({ ok: true, batch: await takeBatchSnapshot() });
             } catch (e: any) {
                 return json({ ok: false, error: String(e?.message ?? e) }, e?.status ?? 502);
+            }
+        }
+
+        if (path === "/batch/cancel" && req.method === "POST") {
+            try {
+                return json({ ok: true, batch: cancelBatch() });
+            } catch (e: any) {
+                return json({ ok: false, error: String(e?.message ?? e) }, e?.status ?? 409);
             }
         }
 

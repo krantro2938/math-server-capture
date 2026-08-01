@@ -31,6 +31,7 @@ POST /start ─┐
 | `POST` | `/batch/start` | Start manual snapshot mode; no model calls yet. Optional `{"note":"...", "max_snapshots":20}` |
 | `POST` | `/batch/snapshot` | Save the camera's current JPEG into the active batch. |
 | `POST` | `/batch/finish` | Send every saved snapshot to the model together and build one assignment. |
+| `POST` | `/batch/cancel` | Drop the batch and its saved snapshots without calling the model. Idempotent; refuses only while `/batch/finish` is still reading. |
 | `POST` | `/photo` | **Read a PHOTO instead of the camera.** The request body IS the image (`image/jpeg\|png\|webp\|heic\|heif`). Resets first — a photo is a different sheet, and merging it into the transcription the camera has been building would interleave two assignments. `?reset=0` opts out, `?note=` passes a note |
 | `GET` | `/assignment` | The assignment as JSON — the thing you're after |
 | `GET` | `/assignment.md` | Same, rendered as Markdown + LaTeX |
@@ -134,6 +135,11 @@ curl -X POST -H "X-API-Token: $TOKEN" http://127.0.0.1:8091/batch/finish
 Snapshots cost no model calls. Finishing sends them as multiple image parts in
 one model request, allowing the AI to compare overlapping views and use a
 clearer close-up to complete an earlier line.
+
+`/batch/cancel` throws the batch and its snapshots away without a model call —
+the way out when you started one by mistake, or aimed at the wrong sheet. It
+leaves the version alone, so what you get back is the blank attempt that
+`/batch/start` created.
 
 ## Live feedback: `GET /events`
 
