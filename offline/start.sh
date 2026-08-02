@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 
 OLLAMA_URL="http://localhost:11434"
 SERVE_PORT=8384
-MATH_MODEL="qwen2.5-math:1.5b"
+MATH_MODEL="hf.co/bartowski/Qwen2.5-Math-1.5B-Instruct-GGUF:Q4_K_M"
 VISION_MODEL="qwen2.5vl:3b"
 RESTART_DELAY=3
 
@@ -124,7 +124,7 @@ check_models() {
   done
 
   local missing=false
-  if ! ollama list 2>/dev/null | grep -q "qwen2.5-math"; then
+  if ! ollama list 2>/dev/null | grep -q "Qwen2.5-Math-1.5B-Instruct"; then
     echo "[start] $MATH_MODEL not found" >&2
     missing=true
   fi
