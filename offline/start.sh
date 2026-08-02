@@ -54,19 +54,29 @@ done
 
 # ── cleanup ────────────────────────────────────────────────────────────────
 
+STOPPING=false
+
 cleanup() {
+  STOPPING=true
   echo "[start] shutting down..." >&2
-  [ -n "$SOLVER_PID" ] && kill "$SOLVER_PID" 2>/dev/null && wait "$SOLVER_PID" 2>/dev/null
-  [ -n "$OLLAMA_PID" ] && kill "$OLLAMA_PID" 2>/dev/null && wait "$OLLAMA_PID" 2>/dev/null
+  # Kill all child processes
+  kill 0 2>/dev/null
+  wait 2>/dev/null
   exit 0
 }
 
-trap cleanup SIGTERM SIGINT EXIT
+trap cleanup SIGTERM SIGINT
 
 # ── Ollama ─────────────────────────────────────────────────────────────────
 
 start_ollama() {
   if [ "$MANAGE_OLLAMA" = false ]; then return; fi
+
+  # If Ollama is already running, don't start another one
+  if curl -sf "$OLLAMA_URL" >/dev/null 2>&1; then
+    echo "[start] Ollama already running" >&2
+    return
+  fi
 
   while true; do
     echo "[start] starting Ollama..." >&2
@@ -84,6 +94,7 @@ start_ollama() {
 
     wait "$OLLAMA_PID" 2>/dev/null || true
     OLLAMA_PID=""
+    [ "$STOPPING" = true ] && return
     echo "[start] Ollama exited — restarting in ${RESTART_DELAY}s..." >&2
     sleep "$RESTART_DELAY"
   done
@@ -109,6 +120,7 @@ start_solver() {
 
     wait "$SOLVER_PID" 2>/dev/null || true
     SOLVER_PID=""
+    [ "$STOPPING" = true ] && return
     echo "[start] solver exited — restarting in ${RESTART_DELAY}s..." >&2
     sleep "$RESTART_DELAY"
   done
