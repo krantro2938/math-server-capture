@@ -4,6 +4,7 @@
 # Usage:
 #   bash offline/start.sh
 #   bash offline/start.sh --no-ollama   # Ollama already running externally
+#   bash offline/start.sh --force       # take over from a copy already running
 #
 # Both processes restart automatically on crash. Ctrl-C stops everything.
 # For auto-start on boot, install termux-boot and run:
@@ -17,6 +18,10 @@ SERVE_PORT=8384
 MATH_MODEL="hf.co/bartowski/Qwen2.5-Math-1.5B-Instruct-GGUF:Q4_K_M"
 VISION_MODEL="qwen2.5vl:3b"
 RESTART_DELAY=3
+# Where ../lookcam/run/dual_capture.sh writes its two rolling JPEGs — same
+# default as SNAPSHOT_DIR in lookcam/run/config.env. Missing files are fine
+# (GET /assignment/camera just 503s until dual_capture.sh is running).
+SNAPSHOT_DIR="$HOME/lookcam-snapshots"
 
 # Allow overrides from config
 [ -f config.local.env ] && source config.local.env
@@ -24,6 +29,8 @@ RESTART_DELAY=3
 MANAGE_OLLAMA=true
 OLLAMA_PID=""
 SOLVER_PID=""
+FORCE=0
+PIDFILE="${PIDFILE:-$HOME/.offline-solver.pid}"
 
 # ── boot installer ─────────────────────────────────────────────────────────
 
@@ -49,8 +56,20 @@ for arg in "$@"; do
   case "$arg" in
     --no-ollama)    MANAGE_OLLAMA=false ;;
     --install-boot) install_boot; exit 0 ;;
+    --force)        FORCE=1 ;;
   esac
 done
+
+# ---- single-instance guard --------------------------------------------------
+# Two copies here means two Ollama servers and two solver.py --serve both
+# trying to bind :8384 — the second one just fails to start, confusingly, and
+# whichever answers first wins for reasons that have nothing to do with which
+# one you meant to keep. Refuse outright instead, the way termux-run.sh does
+# for the camera stream.
+source "$(cd "$(dirname "$0")/.." && pwd)/scripts/singleton-guard.sh"
+singleton_guard "offline solver" "$PIDFILE" "start.sh" \
+  "offline/start\.sh" "solver\.py --serve"
+echo $$ > "$PIDFILE"
 
 # ── cleanup ────────────────────────────────────────────────────────────────
 
@@ -62,6 +81,7 @@ cleanup() {
   # Kill all child processes
   kill 0 2>/dev/null
   wait 2>/dev/null
+  [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
   exit 0
 }
 
@@ -115,7 +135,9 @@ start_solver() {
       --llama "$OLLAMA_URL" \
       --ollama-model "$MATH_MODEL" \
       --vision-model "$VISION_MODEL" \
-      --serve-port "$SERVE_PORT" &
+      --serve-port "$SERVE_PORT" \
+      --camera-primary "$SNAPSHOT_DIR/primary.jpg" \
+      --camera-fallback "$SNAPSHOT_DIR/fallback.jpg" &
     SOLVER_PID=$!
 
     wait "$SOLVER_PID" 2>/dev/null || true

@@ -19,7 +19,9 @@ Requires: requests, sympy (both pip-installable in Termux).
 """
 
 import argparse
+import base64
 import json
+import os
 import re
 import signal
 import subprocess
@@ -34,6 +36,16 @@ except ImportError:
     print("pip install requests", file=sys.stderr)
     sys.exit(1)
 
+try:
+    import render
+except ImportError:
+    render = None
+
+try:
+    import camera_render
+except ImportError:
+    camera_render = None
+
 # ── configuration ───────────────────────────────────────────────────────────
 
 MODEL_NAME = "qwen2.5-math (offline)"
@@ -42,6 +54,23 @@ PROBLEM_TIMEOUT = 90
 TOTAL_TIMEOUT = 600
 
 VISION_MODEL = ""
+
+# ── camera feed (offline Camera page) ───────────────────────────────────────
+#
+# Two LookCam-family cameras, each fed by its own run/capture_snapshot.sh loop
+# on the same phone (see lookcam/run/dual_capture.sh), writing a rolling JPEG
+# to disk independently and forever. This process never talks to the cameras
+# itself — it only reads whichever snapshot file is freshest. See
+# _pick_camera_snapshot().
+CAMERA_SNAPSHOT_PRIMARY = ""
+CAMERA_SNAPSHOT_FALLBACK = ""
+# How old a snapshot can be and still count as "live" for picking between the
+# two cameras. Matches capture_snapshot.sh's default ~1fps.
+CAMERA_FRESH_MS = 4000
+# Past this, neither camera is producing anything usable — both capture loops
+# retry forever on their own, so this is only ever "tell the truth" territory,
+# never a reason to give up.
+CAMERA_STALL_MS = 30_000
 
 # ── llama-server client ─────────────────────────────────────────────────────
 
@@ -524,6 +553,86 @@ _serve_llama_url = ""
 _serve_lock = threading.Lock()
 
 
+def _pick_camera_snapshot() -> tuple[bytes | None, str, float]:
+    """The freshest camera's JPEG bytes, which one it was, and its age in ms.
+
+    Primary wins whenever it's fresh; the fallback only takes over once the
+    primary's snapshot has gone stale. There is no explicit "switch back":
+    each camera's capture_snapshot.sh loop discovers and reconnects forever
+    on its own, independently of the other, so the primary reappearing here
+    is simply its file becoming fresh again on the next poll.
+    """
+    now = time.time()
+    candidates = []
+    for name, path in (("primary", CAMERA_SNAPSHOT_PRIMARY), ("fallback", CAMERA_SNAPSHOT_FALLBACK)):
+        if not path:
+            continue
+        try:
+            age_ms = (now - os.path.getmtime(path)) * 1000
+        except OSError:
+            continue
+        candidates.append((name, path, age_ms))
+
+    if not candidates:
+        return None, "", 0.0
+
+    fresh = [c for c in candidates if c[2] <= CAMERA_FRESH_MS]
+    # Fresh candidates keep the configured preference order (primary first,
+    # since that's the order the tuple above was built in); among stale ones,
+    # the least stale is the more honest thing to show.
+    name, path, age_ms = fresh[0] if fresh else min(candidates, key=lambda c: c[2])
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None, "", 0.0
+    return data, name, age_ms
+
+
+def _build_camera_status() -> dict:
+    """A minimal AssignmentStatus (see evens/test/src/state.ts) reflecting
+    camera-feed health only.
+
+    Offline mode has no scan-tracking pipeline — no per-frame OCR, no framing
+    advice, no edge-coverage gate. Getting problems into the assignment is
+    POST /assignment/photo (one-shot). This exists so the Camera page's menu
+    and corner box read something honest ("nothing read yet") instead of
+    "Connecting..." forever; the "start/stop reading" menu entries it offers
+    have nothing behind them offline and will answer "couldn't start: refused".
+    """
+    _, which, age_ms = _pick_camera_snapshot()
+    if not which:
+        upstream = "disabled"
+    elif age_ms <= CAMERA_STALL_MS:
+        upstream = "open"
+    else:
+        upstream = "error"
+
+    markdown = _serve_state["markdown"]
+    return {
+        "upstream": upstream,
+        "running": False,
+        "done": bool(markdown),
+        "captures": 0,
+        "max_captures": 0,
+        "reason": None,
+        "problems": len(parse_problems(markdown)) if markdown else 0,
+        "problems_complete": 0,
+        "full_page_seen": False,
+        "edges_unseen": [],
+        "next_target": "",
+        "next_target_short": "",
+        "feedback": None,
+        "error": None if which else "no camera configured",
+        "version": 1,
+        "active_version": None,
+        "versions": [],
+        "last_capture_at": None,
+        "batch": {"active": False, "processing": False, "snapshot_count": 0, "max_snapshots": 40},
+    }
+
+
 def _ollama_status() -> dict:
     """Query Ollama /api/ps for loaded models."""
     try:
@@ -614,24 +723,77 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
                 return
 
         if path == "/assignment/status":
-            return self._json(200, {
-                "upstream": "disabled", "running": False, "done": False,
-                "captures": 0, "max_captures": 0, "reason": None,
-                "problems": 0, "problems_complete": 0,
-                "full_page_seen": False, "edges_unseen": [],
-                "next_target": "", "batch": {"active": False,
-                "processing": False, "snapshot_count": 0,
-                "max_snapshots": 0}, "feedback": None,
-                "error": None, "version": 0, "versions": [],
-                "last_capture_at": None,
-            })
+            with _serve_lock:
+                return self._json(200, _build_camera_status())
+
+        if path == "/assignment/camera":
+            return self._handle_camera_preview()
+
+        if path == "/assignment/events":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self._cors()
+            self.end_headers()
+            try:
+                while True:
+                    with _serve_lock:
+                        data = json.dumps(_build_camera_status())
+                    self.wfile.write(f"event: status\ndata: {data}\n\n".encode())
+                    self.wfile.flush()
+                    time.sleep(5)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         self._json(404, {"ok": False, "detail": "not found"})
+
+    def _handle_camera_preview(self):
+        """GET /assignment/camera — one frame from whichever camera is
+        currently active, as tiles (see camera_render.py). Mirrors the shape
+        of evens/server/render/camera.ts's PreviewResponse."""
+        if camera_render is None or not camera_render.CAMERA_RENDER_AVAILABLE:
+            return self._json(503, {"detail": "Pillow not installed"})
+
+        jpeg, which, age_ms = _pick_camera_snapshot()
+        if jpeg is None:
+            return self._json(503, {"detail": "no camera configured"})
+        if age_ms > CAMERA_STALL_MS:
+            return self._json(
+                503,
+                {"detail": f"{which} camera stalled ({round(age_ms / 1000)}s since last frame)"},
+            )
+
+        query = parse_qs(urlparse(self.path).query)
+        size = 1 if query.get("size", ["4"])[0] == "1" else 4
+        try:
+            rotate = int(query.get("rotate", ["0"])[0])
+        except ValueError:
+            rotate = 0
+        mode = query.get("mode", ["ink"])[0]
+
+        try:
+            preview = camera_render.render_camera_tiles(jpeg, size=size, rotate=rotate, mode=mode)
+        except Exception as e:
+            print(f"[serve] camera render failed: {e}", file=sys.stderr)
+            return self._json(500, {"detail": "render failed"})
+
+        return self._json(200, preview)
 
     def do_POST(self):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
+        raw = self.rfile.read(length) if length else b""
+
+        # The photo is the raw image body (see gallery.ts publishPhoto: POST
+        # with Content-Type: image/jpeg and the bytes as the body), never
+        # JSON — do not run it through json.loads with the other endpoints.
+        if path == "/assignment/photo":
+            return self._handle_photo(raw)
+
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return self._json(400, {"ok": False, "detail": "invalid JSON body"})
 
         if path == "/solution/solve":
             return self._handle_solve(body)
@@ -644,18 +806,44 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
                 _serve_state["markdown"] = body.get("markdown", "")
             return self._json(200, {"ok": True})
 
-        if path == "/assignment/photo":
-            image_b64 = body.get("image", "")
-            if not image_b64:
-                return self._json(400, {"ok": False, "detail": "no image"})
-            text = ocr_image(_serve_llama_url, image_b64)
-            if text:
-                with _serve_lock:
-                    _serve_state["markdown"] = text
-                return self._json(200, {"ok": True, "problems": len(parse_problems(text)), "text": text})
+        self._json(404, {"ok": False, "detail": "not found"})
+
+    def _handle_photo(self, raw: bytes):
+        """Publish a photo of the assignment sheet.
+
+        The offline substitute for the camera-based reader: no continuous
+        scan or framing advice, just one-shot OCR of whatever was photographed
+        (see gallery.ts publishPhoto, used by both the companion web app's
+        "Publish" button and the glasses Settings page's gallery import).
+        """
+        if not raw:
+            return self._json(400, {"ok": False, "detail": "no image"})
+        if not VISION_MODEL:
+            return self._json(500, {"ok": False, "detail": "no vision model configured"})
+
+        query = parse_qs(urlparse(self.path).query)
+        reset = query.get("reset", ["0"])[0] == "1"
+
+        image_b64 = base64.b64encode(raw).decode()
+        text = ocr_image(_serve_llama_url, image_b64)
+        if not text:
             return self._json(500, {"ok": False, "detail": "OCR failed"})
 
-        self._json(404, {"ok": False, "detail": "not found"})
+        with _serve_lock:
+            # Merge onto the existing transcription the way a camera frame
+            # would, unless the caller said this is a different sheet.
+            if reset or not _serve_state["markdown"]:
+                _serve_state["markdown"] = text
+            else:
+                _serve_state["markdown"] = _serve_state["markdown"].rstrip() + "\n\n" + text
+            # A changed assignment answers a different question than whatever
+            # was last solved — bring the button back rather than leaving it
+            # on a stale "solved".
+            if _serve_state["state"] != "solving":
+                _serve_state["state"] = "idle"
+            problems = len(parse_problems(_serve_state["markdown"]))
+
+        return self._json(200, {"ok": True, "problems": problems, "done": True})
 
     def do_PUT(self):
         path = urlparse(self.path).path
@@ -703,8 +891,17 @@ def _build_status() -> dict:
             "stale": False,
             "chars": len(s["solution"].get("markdown", "")),
         }
+    # The client's button only invites a tap for `idle`/`failed`; without this
+    # a fresh server with nothing transcribed yet still reports "idle" and the
+    # AI page shows "SOLVE WITH CLAUDE / TAP TO RUN" over zero problems, which
+    # then 400s "no assignment" the moment you tap it. See server/solver.ts's
+    # getSolverStatus for the online equivalent of this gate.
+    state = s["state"]
+    if state == "idle" and not s["markdown"]:
+        state = "no_assignment"
+
     return {
-        "state": s["state"],
+        "state": state,
         "assignment": {
             "available": bool(s["markdown"]),
             "version": 1 if s["markdown"] else None,
@@ -721,8 +918,28 @@ def _build_status() -> dict:
 
 
 def _build_tiles() -> dict:
-    """Placeholder: return empty tiles. Full rendering will use the WebView."""
-    return {"version": 0, "pages": []}
+    """Render the current solution to tile PNGs (see render.py).
+
+    Cached on the solution dict and keyed by its created_at timestamp, so
+    repeated polling (the client hits /tiles on every status change) doesn't
+    re-render. If render.py's deps aren't installed, falls back to empty
+    pages — the client then renders client-side in the WebView instead (see
+    evens/test/src/render/tiles.ts), which is what this replaces.
+    """
+    sol = _serve_state["solution"]
+    if not sol or not sol.get("markdown") or render is None or not render.RENDER_AVAILABLE:
+        return {"version": 0, "pages": []}
+
+    version = sol["created_at"]
+    if sol.get("tiles_version") != version:
+        try:
+            sol["tiles"] = render.render_markdown_to_tiles(sol["markdown"])
+        except Exception as e:
+            print(f"[serve] tile render failed: {e}", file=sys.stderr)
+            sol["tiles"] = []
+        sol["tiles_version"] = version
+
+    return {"version": version, "pages": sol.get("tiles", [])}
 
 
 def _solve_thread():
@@ -773,6 +990,14 @@ def serve(host: str, port: int, llama_url: str):
     server = http.server.HTTPServer((host, port), _LocalHandler)
     print(f"[serve] listening on http://{host}:{port}", file=sys.stderr)
     print(f"[serve] llama: {llama_url}  model: {OLLAMA_MODEL or '(llama.cpp)'}", file=sys.stderr)
+    if CAMERA_SNAPSHOT_PRIMARY or CAMERA_SNAPSHOT_FALLBACK:
+        print(f"[serve] camera: primary={CAMERA_SNAPSHOT_PRIMARY or '(none)'} "
+              f"fallback={CAMERA_SNAPSHOT_FALLBACK or '(none)'}", file=sys.stderr)
+    elif camera_render is None or not camera_render.CAMERA_RENDER_AVAILABLE:
+        print("[serve] camera: Pillow not installed — /assignment/camera will 503", file=sys.stderr)
+    else:
+        print("[serve] camera: no --camera-primary/--camera-fallback configured — "
+              "/assignment/camera will 503", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -785,6 +1010,7 @@ def serve(host: str, port: int, llama_url: str):
 
 def main():
     global SYMPY_TIMEOUT, PROBLEM_TIMEOUT, TOTAL_TIMEOUT, OLLAMA_MODEL, VISION_MODEL
+    global CAMERA_SNAPSHOT_PRIMARY, CAMERA_SNAPSHOT_FALLBACK, CAMERA_FRESH_MS
 
     parser = argparse.ArgumentParser(description="Offline SymPy solver")
     parser.add_argument("--server", default="http://localhost:8787",
@@ -810,6 +1036,14 @@ def main():
     parser.add_argument("--sympy-timeout", type=int, default=SYMPY_TIMEOUT)
     parser.add_argument("--problem-timeout", type=int, default=PROBLEM_TIMEOUT)
     parser.add_argument("--total-timeout", type=int, default=TOTAL_TIMEOUT)
+    parser.add_argument("--camera-primary", default="",
+                        help="path to the primary camera's rolling JPEG snapshot "
+                             "(written by lookcam/run/capture_snapshot.sh)")
+    parser.add_argument("--camera-fallback", default="",
+                        help="path to the fallback camera's rolling JPEG snapshot")
+    parser.add_argument("--camera-fresh-ms", type=int, default=CAMERA_FRESH_MS,
+                        help="how old a snapshot can be and still count as live "
+                             "before /assignment/camera prefers the other camera")
     args = parser.parse_args()
 
     SYMPY_TIMEOUT = args.sympy_timeout
@@ -817,6 +1051,9 @@ def main():
     TOTAL_TIMEOUT = args.total_timeout
     OLLAMA_MODEL = args.ollama_model
     VISION_MODEL = args.vision_model
+    CAMERA_SNAPSHOT_PRIMARY = args.camera_primary
+    CAMERA_SNAPSHOT_FALLBACK = args.camera_fallback
+    CAMERA_FRESH_MS = args.camera_fresh_ms
 
     if args.serve:
         serve(args.serve_host, args.serve_port, args.llama)

@@ -19,6 +19,8 @@ echo "--- Installing system packages ---"
 pkg update -y
 pkg install -y \
   python \
+  python-pillow \
+  python-matplotlib \
   cmake \
   clang \
   make \
@@ -28,6 +30,12 @@ pkg install -y \
   vulkan-loader-android
 
 # ── Python dependencies ─────────────────────────────────────────────────────
+#
+# Pillow and matplotlib come from `pkg` above (precompiled for Termux) rather
+# than pip — building their C extensions on-device is slow and has a history
+# of failing on Android (missing headers, denied setxattr calls). matplotlib
+# is only used for its mathtext module (offline/render.py), which renders
+# LaTeX-like math to PNG tiles without needing a browser or a LaTeX install.
 
 echo ""
 echo "--- Installing Python packages ---"
@@ -41,6 +49,32 @@ x = Symbol('x')
 result = solve(x**2 - 4, x)
 assert result == [-2, 2], f'SymPy test failed: {result}'
 print('SymPy OK: solve(x²-4) =', result)
+"
+
+# Verify the tile renderer (Pillow + matplotlib mathtext) works.
+python3 -c "
+import sys
+sys.path.insert(0, '$(cd "$(dirname "$0")" && pwd)')
+import render
+assert render.RENDER_AVAILABLE, 'Pillow/matplotlib not importable'
+pages = render.render_markdown_to_tiles('## 1\n\nSolve \$x^2=4\$: **Ответ: \$x=\\\\pm 2\$**')
+assert pages and pages[0]['tiles'], 'render produced no tiles'
+print('Renderer OK:', len(pages), 'page(s)')
+"
+
+# Verify the camera preview renderer (Pillow only, no matplotlib) works —
+# GET /assignment/camera in solver.py, fed by lookcam/run/dual_capture.sh.
+python3 -c "
+import io, sys
+sys.path.insert(0, '$(cd "$(dirname "$0")" && pwd)')
+from PIL import Image
+import camera_render as cr
+assert cr.CAMERA_RENDER_AVAILABLE, 'Pillow not importable'
+buf = io.BytesIO()
+Image.new('RGB', (640, 480), (150, 150, 150)).save(buf, format='JPEG')
+result = cr.render_camera_tiles(buf.getvalue(), size=4, mode='ink')
+assert len(result['tiles']) == 4, f'expected 4 tiles, got {len(result[\"tiles\"])}'
+print('Camera renderer OK:', len(result['tiles']), 'tiles, contrast=', result['contrast'])
 "
 
 # ── llama.cpp ───────────────────────────────────────────────────────────────
