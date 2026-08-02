@@ -114,6 +114,31 @@ start_solver() {
   done
 }
 
+# ── model check ────────────────────────────────────────────────────────────
+
+check_models() {
+  # Wait for Ollama to be up
+  for i in $(seq 1 15); do
+    curl -sf "$OLLAMA_URL" >/dev/null 2>&1 && break
+    sleep 1
+  done
+
+  local missing=false
+  if ! ollama list 2>/dev/null | grep -q "qwen2.5-math"; then
+    echo "[start] qwen2.5-math:1.5b not found" >&2
+    missing=true
+  fi
+  if ! ollama list 2>/dev/null | grep -q "qwen2.5vl"; then
+    echo "[start] qwen2.5vl:3b not found" >&2
+    missing=true
+  fi
+
+  if [ "$missing" = true ]; then
+    echo "[start] models missing — run: bash offline/setup-models.sh" >&2
+    exit 1
+  fi
+}
+
 # ── main ───────────────────────────────────────────────────────────────────
 
 echo "[start] offline solver stack starting" >&2
@@ -121,6 +146,12 @@ echo "[start] math: $MATH_MODEL | vision: $VISION_MODEL" >&2
 echo "[start] serve: :$SERVE_PORT | ollama: $OLLAMA_URL" >&2
 
 start_ollama &
+
+# Give Ollama a moment, then verify models exist before starting the solver
+if [ "$MANAGE_OLLAMA" = true ]; then
+  check_models
+fi
+
 start_solver &
 
 # Wait for either to exit (they shouldn't — the loops restart them)
