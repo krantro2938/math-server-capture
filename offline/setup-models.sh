@@ -26,8 +26,9 @@ if ollama list 2>/dev/null | grep -q "qwen2.5-math"; then
   echo "[setup] qwen2.5-math:1.5b already registered" >&2
 else
   GGUF_URL="https://huggingface.co/bartowski/Qwen2.5-Math-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Math-1.5B-Instruct-Q4_K_M.gguf"
-  GGUF_FILE="/tmp/qwen2.5-math-1.5b-instruct-q4_k_m.gguf"
-  MODELFILE="/tmp/Modelfile.qwen25math"
+  GGUF_FILE="$HOME/.ollama/qwen2.5-math-1.5b-instruct-q4_k_m.gguf"
+  MODELFILE="$HOME/.ollama/Modelfile.qwen25math"
+  mkdir -p "$HOME/.ollama"
 
   if [ ! -f "$GGUF_FILE" ]; then
     echo "[setup] downloading Qwen2.5-Math-1.5B GGUF (~940MB)..." >&2
@@ -36,8 +37,8 @@ else
     echo "[setup] GGUF already downloaded at $GGUF_FILE" >&2
   fi
 
-  cat > "$MODELFILE" <<'EOF'
-FROM /tmp/qwen2.5-math-1.5b-instruct-q4_k_m.gguf
+  cat > "$MODELFILE" <<EOF
+FROM $GGUF_FILE
 TEMPLATE """{{- if .System }}<|im_start|>system
 {{ .System }}<|im_end|>
 {{ end }}<|im_start|>user
