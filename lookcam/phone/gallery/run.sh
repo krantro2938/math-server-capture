@@ -17,7 +17,9 @@
 # below and an Unrestricted battery setting are what actually prevent that, and
 # the setup script says so.
 #
-#   bash ~/lookcam/phone/gallery/run.sh      # by hand (Ctrl-C to stop)
+#   bash ~/lookcam/phone/gallery/run.sh            # by hand (Ctrl-C to stop)
+#   bash ~/lookcam/phone/gallery/run.sh --force    # ...taking over from a
+#                                                  #    copy already running
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -33,8 +35,26 @@ CONFIG_RETRY=${CONFIG_RETRY:-60}
 # consecutive misses before it is treated as wedged rather than busy.
 PROBE_EVERY=${PROBE_EVERY:-30}
 PROBE_MISSES=${PROBE_MISSES:-2}
+PIDFILE="${PIDFILE:-$HOME/.lookcam-gallery.pid}"
+
+FORCE=0
+case "${1:-}" in
+  --force|--takeover) FORCE=1; shift ;;
+  "") ;;
+esac
 
 log() { echo "[$(date '+%F %T')] $*"; }
+
+# ---- single-instance guard ---------------------------------------------------
+# Two copies of the bridge both try to bind $PORT — the second one's gallery.py
+# exits 78 (port taken) and this script just backs off and retries forever,
+# which used to be the only feedback you got. Refuse outright instead, and name
+# what's already running, the same way termux-run.sh does for the camera
+# stream.
+source "$HERE/../../../scripts/singleton-guard.sh"
+singleton_guard "gallery bridge" "$PIDFILE" "gallery/run.sh" \
+  "gallery/run\.sh" "gallery\.py"
+echo $$ > "$PIDFILE"
 
 # Keep the CPU alive. Without this Android suspends Termux within minutes of the
 # screen going off — and this is exactly the moment you want the bridge up: the
@@ -43,6 +63,7 @@ command -v termux-wake-lock >/dev/null && termux-wake-lock
 cleanup() {
   [ -n "${BRIDGE_PID:-}" ] && kill "$BRIDGE_PID" 2>/dev/null
   command -v termux-wake-unlock >/dev/null && termux-wake-unlock
+  [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
 }
 trap cleanup EXIT INT TERM
 
