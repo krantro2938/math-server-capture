@@ -20,38 +20,14 @@ if ! curl -sf "$OLLAMA_URL" >/dev/null 2>&1; then
   exit 1
 fi
 
-# ── qwen2.5-math:1.5b (manual GGUF) ──────────────────────────────────────
+# ── qwen2.5:1.5b (from Ollama registry) ───────────────────────────────────
 
-if ollama list 2>/dev/null | grep -q "qwen2.5-math"; then
-  echo "[setup] qwen2.5-math:1.5b already registered" >&2
+if ollama list 2>/dev/null | grep -q "qwen2.5:1.5b\|qwen2.5:latest"; then
+  echo "[setup] qwen2.5:1.5b already registered" >&2
 else
-  GGUF_URL="https://huggingface.co/bartowski/Qwen2.5-Math-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Math-1.5B-Instruct-Q4_K_M.gguf"
-  GGUF_FILE="$HOME/.ollama/qwen2.5-math-1.5b-instruct-q4_k_m.gguf"
-  MODELFILE="$HOME/.ollama/Modelfile.qwen25math"
-  mkdir -p "$HOME/.ollama"
-
-  if [ ! -f "$GGUF_FILE" ]; then
-    echo "[setup] downloading Qwen2.5-Math-1.5B GGUF (~940MB)..." >&2
-    curl -L --progress-bar -o "$GGUF_FILE" "$GGUF_URL"
-  else
-    echo "[setup] GGUF already downloaded at $GGUF_FILE" >&2
-  fi
-
-  cat > "$MODELFILE" <<EOF
-FROM $GGUF_FILE
-TEMPLATE """{{- if .System }}<|im_start|>system
-{{ .System }}<|im_end|>
-{{ end }}<|im_start|>user
-{{ .Prompt }}<|im_end|>
-<|im_start|>assistant
-"""
-PARAMETER stop "<|im_end|>"
-PARAMETER stop "<|endoftext|>"
-EOF
-
-  echo "[setup] registering qwen2.5-math:1.5b with Ollama..." >&2
-  ollama create qwen2.5-math:1.5b -f "$MODELFILE"
-  echo "[setup] qwen2.5-math:1.5b ready" >&2
+  echo "[setup] pulling qwen2.5:1.5b (~940MB)..." >&2
+  ollama pull qwen2.5:1.5b
+  echo "[setup] qwen2.5:1.5b ready" >&2
 fi
 
 # ── qwen2.5vl:3b (from Ollama registry) ──────────────────────────────────
