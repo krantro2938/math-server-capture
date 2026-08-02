@@ -11,7 +11,13 @@
 #   bash offline/start.sh --install-boot
 
 set -euo pipefail
-cd "$(dirname "$0")"
+# Absolute, and computed ONCE, before anything below cd's into it: re-deriving
+# a path from $0 after moving away from the original invocation directory is
+# exactly what broke the singleton-guard source below (dirname "$0" stayed
+# "offline", so evaluating it a second time after the cd landed one directory
+# too deep).
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE"
 
 OLLAMA_URL="http://localhost:11434"
 SERVE_PORT=8384
@@ -66,7 +72,7 @@ done
 # whichever answers first wins for reasons that have nothing to do with which
 # one you meant to keep. Refuse outright instead, the way termux-run.sh does
 # for the camera stream.
-source "$(cd "$(dirname "$0")/.." && pwd)/scripts/singleton-guard.sh"
+source "$HERE/../scripts/singleton-guard.sh"
 singleton_guard "offline solver" "$PIDFILE" "start.sh" \
   "offline/start\.sh" "solver\.py --serve"
 echo $$ > "$PIDFILE"
