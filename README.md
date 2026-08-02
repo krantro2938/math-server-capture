@@ -25,7 +25,7 @@ what talks to what, and the order to bring it all up in.
 
 | | Online | Offline |
 |---|---|---|
-| Camera reading | A real LookCam-family camera, `lookcam/run/capture.sh` streams it to a VPS, a Gemini-backed reader transcribes it live with framing advice | One or two LookCam cameras (`lookcam/run/dual_capture.sh`), a rolling local JPEG per camera, no advice — publish a photo instead (see below) |
+| Camera reading | `lookcam/run/capture.sh` streams one camera to the VPS, with genuine failover to a second (`CAM_UID_FALLBACK`) if the first stops answering — only one ever pushes to the VPS at a time, see `run/config.env`. A Gemini-backed reader transcribes it live with framing advice. | `lookcam/run/dual_capture.sh` keeps a rolling local JPEG from each of up to two cameras and just serves whichever is freshest — no advice, publish a photo instead (see below) |
 | Solving | A Claude routine (cloud), triggered by a tap | `offline/solver.py`, driving Qwen2.5-Math through Ollama, on the same phone |
 | Serving the glasses | `evens/server` (VPS), renders tiles server-side with headless Chromium | `offline/solver.py --serve` on the phone, renders tiles with Pillow (`offline/render.py`, `offline/camera_render.py`) |
 | Switching | `evens/test/src/services/backend.ts` — `auto` picks whichever is reachable, `online`/`offline` pin it. Persisted in the app; changeable from Settings. | |
