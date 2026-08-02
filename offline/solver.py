@@ -69,6 +69,7 @@ def llama_generate(url: str, prompt: str, max_tokens: int = 2048,
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
+            "keep_alive": "10s",
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature,
@@ -488,6 +489,7 @@ def ocr_image(ollama_url: str, image_b64: str, timeout: int = 120) -> str | None
         "prompt": VISION_PROMPT,
         "images": [image_b64],
         "stream": False,
+        "keep_alive": "10s",
         "options": {"num_predict": 2048, "temperature": 0.1},
     }
     try:
@@ -522,6 +524,25 @@ _serve_llama_url = ""
 _serve_lock = threading.Lock()
 
 
+def _ollama_status() -> dict:
+    """Query Ollama /api/ps for loaded models."""
+    try:
+        resp = requests.get(f"{_serve_llama_url}/api/ps", timeout=3)
+        resp.raise_for_status()
+        models = resp.json().get("models", [])
+        loaded = []
+        for m in models:
+            size_mb = round(m.get("size", 0) / 1024 / 1024)
+            loaded.append({
+                "name": m.get("name", ""),
+                "size_mb": size_mb,
+                "expires_at": m.get("expires_at", ""),
+            })
+        return {"ok": True, "models": loaded}
+    except Exception:
+        return {"ok": False, "models": []}
+
+
 class _LocalHandler(http.server.BaseHTTPRequestHandler):
 
     def _cors(self):
@@ -550,6 +571,9 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/settings/mode":
             return self._json(200, {"value": "offline"})
+
+        if path == "/ollama/status":
+            return self._json(200, _ollama_status())
 
         if path == "/solution/status":
             with _serve_lock:
