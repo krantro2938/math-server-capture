@@ -20,6 +20,9 @@ services:
   mediamtx:
     image: bluenviron/mediamtx:1
     restart: unless-stopped
+    # Steady state is ~20MB — it muxes to disk rather than buffering in RAM.
+    # 256m is an order of magnitude of headroom and still leaves the box room.
+    mem_limit: 256m
     working_dir: /                     # so the config's ./recordings == /recordings
     volumes:
       - ../mediamtx.yml:/mediamtx.yml:ro
@@ -53,6 +56,10 @@ services:
       context: ../..
       dockerfile: vps/docker/Dockerfile.transcode
     restart: unless-stopped
+    # ffmpeg holding a 1080p pipeline. Steady state is ~37MB, but a stream
+    # re-negotiation can spike it, so this is deliberately loose — it exists to
+    # stop a runaway decode taking the host down, not to police normal use.
+    mem_limit: 512m
     depends_on: [mediamtx]
     environment:
       MTX_HOST: mediamtx              # service name on the compose network
@@ -129,6 +136,8 @@ services:
     build:
       context: ../../assignment
     restart: unless-stopped
+    # ~24MB steady; the peaks are snapshot buffers on their way to Gemini.
+    mem_limit: 384m
     profiles: [assignment]
     depends_on: [mediamtx, web]
     ports:
@@ -191,6 +200,10 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
+    # ~12MB. It streams SSE with flush_interval -1 rather than buffering, so it
+    # has no growth path — but it fronts every domain, so cap it anyway: if the
+    # box is ever under pressure, this is the last thing that should be chosen.
+    mem_limit: 128m
     profiles: [caddy]
     depends_on: [web]
     ports:
