@@ -20,7 +20,6 @@ pkg update -y
 pkg install -y \
   python \
   python-pillow \
-  python-matplotlib \
   cmake \
   clang \
   make \
@@ -29,13 +28,31 @@ pkg install -y \
   vulkan-headers \
   vulkan-loader-android
 
+# matplotlib is not in termux-main — it was dropped because it needs a full
+# C/C++ + freetype build for every Python minor version. It lives in the
+# Termux User Repository (tur-repo) instead, under a name that has changed
+# between builds; if neither name resolves, build the wheel with pip.
+if ! python3 -c "import matplotlib" 2>/dev/null; then
+  echo ""
+  echo "--- Installing matplotlib ---"
+  pkg install -y tur-repo || true
+  pkg install -y matplotlib || pkg install -y python-matplotlib || true
+fi
+
+if ! python3 -c "import matplotlib" 2>/dev/null; then
+  echo "matplotlib not available from pkg — building it with pip (slow, ~10 min)"
+  pkg install -y python-numpy freetype libpng pkg-config build-essential || true
+  pip install matplotlib
+fi
+
 # ── Python dependencies ─────────────────────────────────────────────────────
 #
-# Pillow and matplotlib come from `pkg` above (precompiled for Termux) rather
-# than pip — building their C extensions on-device is slow and has a history
-# of failing on Android (missing headers, denied setxattr calls). matplotlib
-# is only used for its mathtext module (offline/render.py), which renders
-# LaTeX-like math to PNG tiles without needing a browser or a LaTeX install.
+# Pillow and matplotlib are preferred from `pkg` above (precompiled for
+# Termux) rather than pip — building their C extensions on-device is slow and
+# has a history of failing on Android (missing headers, denied setxattr
+# calls). matplotlib is only used for its mathtext module (offline/render.py),
+# which renders LaTeX-like math to PNG tiles without needing a browser or a
+# LaTeX install.
 
 echo ""
 echo "--- Installing Python packages ---"
