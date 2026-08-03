@@ -148,9 +148,13 @@ services:
       SNAPSHOT_TOKEN: ${SNAPSHOT_TOKEN:?set SNAPSHOT_TOKEN in .env}
       RTSP_URL: rtsp://${VIEW_USER:-viewer}:${VIEW_PASS:?}@mediamtx:8554/${STREAM_KEY:-cam1}
       GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
-      # Second attempt, only when the primary 404s / rate-limits / 5xx's.
-      GEMINI_MODEL_FALLBACK: ${GEMINI_MODEL_FALLBACK:-gemini-3.1-flash-lite}
+      # The Gemini rungs, in order. Each is tried only when the one above it
+      # 404s / rate-limits / 5xx's or returns something unusable. GEMINI_MODELS
+      # (comma-separated) overrides all three at once.
+      GEMINI_MODELS: ${GEMINI_MODELS:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      GEMINI_MODEL_FALLBACK: ${GEMINI_MODEL_FALLBACK:-gemini-3.5-flash-lite}
+      GEMINI_MODEL_FALLBACK_2: ${GEMINI_MODEL_FALLBACK_2:-gemini-3.1-flash-lite}
       # The backup PROVIDER, tried only after BOTH Gemini models have failed. A
       # second Google model is no help against an outage at Google, a revoked key
       # or a region-wide 429 — which are the failures that leave a camera reading
@@ -163,6 +167,22 @@ services:
       # the loop is sequential, so this is not a fixed capture cadence.
       INTERVAL_MS: ${ASSIGNMENT_INTERVAL_MS:-2500}
       MAX_CAPTURES: ${ASSIGNMENT_MAX_CAPTURES:-40}   # spend ceiling per job
+
+      # A manual snapshot batch goes to a Claude routine before it goes to the
+      # models above: the operator framed those images themselves, so it is pure
+      # transcription and worth a stronger reader. Leave either of these empty
+      # and batches read exactly as they did before, on the chain alone.
+      #
+      # The token is the routine's own API-trigger token (routine → pencil →
+      # Select a trigger → API → Generate token). It can fire that one routine
+      # and nothing else, which is why it is safe to keep in a .env.
+      READ_ROUTINE_ID: ${READ_ROUTINE_ID:-}
+      READ_ROUTINE_TOKEN: ${READ_ROUTINE_TOKEN:-}
+      # How long to wait for an agent to claim before the chain takes over. A
+      # cloud session spends ~30-60s booting, so this cannot be short.
+      READ_CLAIM_TIMEOUT_MS: ${READ_CLAIM_TIMEOUT_MS:-150000}
+      # And how long a claimed read may then take.
+      READ_SUBMIT_TIMEOUT_MS: ${READ_SUBMIT_TIMEOUT_MS:-600000}
 
   # ----------------------------------------------------------------- caddy ---
   # Optional, opt-in: `docker compose --profile caddy up -d`. Gets a Let's

@@ -41,6 +41,12 @@ import {
 } from "node:fs";
 import { join, dirname } from "node:path";
 
+/** A comma-separated model list, or the defaults with the empties dropped. */
+function modelList(csv: string | undefined, defaults: string[]): string[] {
+    const source = csv ? csv.split(",") : defaults;
+    return source.map((m) => m.trim()).filter(Boolean);
+}
+
 const cfg = {
     port: Number(process.env.PORT ?? 8091),
     // Shared-secret auth. Leave empty ONLY if this port is unreachable from the
@@ -48,14 +54,22 @@ const cfg = {
     token: process.env.API_TOKEN ?? "",
 
     geminiKey: process.env.GEMINI_API_KEY ?? "",
-    // NOTE: this exact model id is what you asked for; it is not one this code has
-    // ever seen answer. If Google returns 404 "model not found", the id is the
-    // thing to change — nothing else here depends on it.
+    // The Gemini rungs, in the order they are tried. A rung is only reached when
+    // the one above it failed in a way another model might survive (404 / 429 /
+    // 5xx, or unusable output) — see nextRung.
+    //
+    // NOTE: these exact model ids are what you asked for; they are not ones this
+    // code has seen answer. If Google returns 404 "model not found", the id is
+    // the thing to change — nothing else here depends on it.
     // Known-good alternatives: gemini-2.5-flash-lite, gemini-2.5-flash.
-    model: process.env.GEMINI_MODEL ?? "gemini-3.5-flash-lite",
-    // Tried only when the primary fails in a way the other model might survive
-    // (404 / 429 / 5xx, or unusable output). Empty disables the retry.
-    modelFallback: process.env.GEMINI_MODEL_FALLBACK ?? "gemini-3.1-flash-lite",
+    //
+    // `GEMINI_MODELS` (comma-separated) sets the whole list at once. The three
+    // single-model vars still work so an existing .env keeps its behaviour.
+    geminiModels: modelList(process.env.GEMINI_MODELS, [
+        process.env.GEMINI_MODEL ?? "gemini-3.6-flash",
+        process.env.GEMINI_MODEL_FALLBACK ?? "gemini-3.5-flash-lite",
+        process.env.GEMINI_MODEL_FALLBACK_2 ?? "gemini-3.1-flash-lite",
+    ]),
     geminiBase:
         process.env.GEMINI_BASE_URL ??
         "https://generativelanguage.googleapis.com",
@@ -96,6 +110,22 @@ const cfg = {
     dataDir: process.env.DATA_DIR ?? "./data",
     maxBatchSnapshots: Number(process.env.MAX_BATCH_SNAPSHOTS ?? 40),
     maxBatchBytes: Number(process.env.MAX_BATCH_BYTES ?? 12_000_000),
+
+    // A Claude routine gets first refusal on a manual batch (see readViaRoutine).
+    // Absent id or token and the batch goes straight to the model chain, which is
+    // how this behaved before — an unconfigured routine is not an error.
+    readRoutineId: process.env.READ_ROUTINE_ID ?? "",
+    readRoutineToken: process.env.READ_ROUTINE_TOKEN ?? "",
+    routineApi: (process.env.ROUTINE_API ?? "https://api.anthropic.com").replace(/\/+$/, ""),
+    routineBeta: process.env.ROUTINE_BETA ?? "experimental-cc-routine-2026-04-01",
+    anthropicVersion: process.env.ANTHROPIC_VERSION ?? "2023-06-01",
+    /** How long to wait for an agent to CLAIM before giving up on it. A cloud
+     *  session takes ~30-60s just to boot, so this is generous by necessity. */
+    readClaimMs: Number(process.env.READ_CLAIM_TIMEOUT_MS ?? 150_000),
+    /** How long a claimed read may then take. Past this the chain reads instead —
+     *  a claimed-but-silent agent must not strand the batch forever. */
+    readSubmitMs: Number(process.env.READ_SUBMIT_TIMEOUT_MS ?? 600_000),
+    fireTimeoutMs: Number(process.env.ROUTINE_FIRE_TIMEOUT_MS ?? 20_000),
 };
 
 const STATE_FILE = join(cfg.dataDir, "state.json");
@@ -172,6 +202,14 @@ type Batch = {
     max_snapshots: number;
     note: string;
     error: string | null;
+    /** Who is reading it: "claude-routine" while an agent has it, then whoever
+     *  actually answered ("anthropic/claude-routine", "gemini/…"). Null when no
+     *  batch has been read yet. The glasses show this, so a fallback is visible
+     *  rather than something you discover from a byline three screens away. */
+    reader: string | null;
+    /** Where the routine attempt got to: queued → claimed → submitted, or
+     *  unclaimed/failed when the model chain had to take over. */
+    read_state: string | null;
 };
 
 type State = {
@@ -211,6 +249,8 @@ const idleBatch = (): Batch => ({
     max_snapshots: cfg.maxBatchSnapshots,
     note: "",
     error: null,
+    reader: null,
+    read_state: null,
 });
 
 const emptyAssignment = (): Assignment => ({
@@ -252,6 +292,16 @@ function loadState(): State {
             ) as State;
             loaded.job = { ...idleJob(), ...(loaded.job ?? {}) }; // state.json from an older build
             loaded.batch = { ...idleBatch(), ...(loaded.batch ?? {}) };
+            if (loaded.batch.processing) {
+                // A read in flight when the process died. Its in-memory half —
+                // the pending claim, the deadlines, the promise the frames were
+                // waiting on — did not survive, so nothing will ever finish it.
+                // Left as it was, the glasses show "Reading N images" forever.
+                loaded.batch.processing = false;
+                loaded.batch.error = "the reader restarted mid-read";
+                loaded.batch.read_state = "interrupted";
+                loaded.batch.finished_at = new Date().toISOString();
+            }
             loaded.full_page_seen = Boolean(loaded.full_page_seen); // ditto
             loaded.edges_seen = Array.isArray(loaded.edges_seen)
                 ? loaded.edges_seen.map(String)
@@ -655,9 +705,7 @@ type Attempt = { provider: "gemini" | "mistral"; model: string };
 function buildChain(): Attempt[] {
     const chain: Attempt[] = [];
     if (cfg.geminiKey) {
-        if (cfg.model) chain.push({ provider: "gemini", model: cfg.model });
-        if (cfg.modelFallback)
-            chain.push({ provider: "gemini", model: cfg.modelFallback });
+        for (const model of cfg.geminiModels) chain.push({ provider: "gemini", model });
     }
     if (cfg.mistralKey) {
         if (cfg.mistralModel)
@@ -1282,6 +1330,7 @@ async function doCapture(
         });
         const modelStart = Date.now();
         const { result, used } = await readFrame(frames, note, mime);
+        lastReader = `${used.provider}/${used.model}`;
         emit("model_response", {
             ms: Date.now() - modelStart,
             provider: used.provider,
@@ -1516,6 +1565,325 @@ function cancelBatch(): Batch {
     return state.batch;
 }
 
+// ------------------------------------------------- reading a batch as Claude --
+//
+// A manual batch is the one case where the operator has already done the hard
+// part: they framed every section themselves and said "that is all of it". There
+// is no camera to steer any more, so the job is pure transcription over a fixed
+// set of images — which is worth handing to a stronger reader than the frame-by
+// -frame chain, and worth waiting a couple of minutes for.
+//
+// The shape is the one the solve loop already uses (evens/server/solver.ts), for
+// the same reason: a cloud routine cannot be called and awaited like a function.
+// It is *fired*, boots a session somewhere, and comes back to us.
+//
+//   POST /batch/finish ─▶ processBatch ─▶ fire the routine, then wait
+//   the agent      ──▶ GET  /batch/claim        the job + a one-time token
+//                  ──▶ GET  /batch/frame/N      each snapshot, as JPEG
+//                  ──▶ POST /batch/submit       the finished transcription
+//                   or  POST /batch/fail        "I can't", so we stop waiting
+//
+// The token is the concurrency story, exactly as it is over there: it is minted
+// per read and checked on submit, so a slow agent whose read has already timed
+// out into the model chain cannot land its answer on top of the chain's.
+//
+// TWO DEADLINES, not one, because "nobody came" and "someone came and got stuck"
+// are different failures with very different sensible waits. Missing the claim
+// deadline usually means the routine is misconfigured — no repo, no network
+// allowlist, wrong token — and burning ten minutes on that before falling back
+// would make every batch feel broken.
+
+type ReadOutcome =
+    | {
+          kind: "submitted";
+          assignment: Assignment;
+          observations: Observation[];
+          done: boolean;
+          edges_seen: string[];
+          full_page_visible: boolean;
+          notes: string;
+      }
+    | { kind: "failed"; error: string };
+
+interface PendingRead {
+    id: string;
+    token: string;
+    version: number;
+    note: string;
+    count: number;
+    files: string[];
+    created_at: number;
+    claimed_at: number | null;
+    session_url: string | null;
+    /** Assigned synchronously by waitForRead, before this is ever published. */
+    settle: (outcome: ReadOutcome) => void;
+}
+
+/** The read an agent may claim right now. At most one exists: a batch read is
+ *  strictly serialised behind `state.batch.processing`. */
+let pendingRead: PendingRead | null = null;
+
+/** provider/model of the last chain read, for `batch.reader`. */
+let lastReader: string | null = null;
+
+/**
+ * Fire the reading routine. Never throws — a fire that fails is not fatal, it
+ * just means nothing will claim, which the claim deadline already handles (and
+ * a locally-running drainer might claim anyway).
+ */
+async function fireReadRoutine(text: string): Promise<string | null> {
+    try {
+        const res = await fetch(
+            `${cfg.routineApi}/v1/claude_code/routines/${cfg.readRoutineId}/fire`,
+            {
+                method: "POST",
+                headers: {
+                    authorization: `Bearer ${cfg.readRoutineToken}`,
+                    "anthropic-version": cfg.anthropicVersion,
+                    "anthropic-beta": cfg.routineBeta,
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify({ text }),
+                signal: AbortSignal.timeout(cfg.fireTimeoutMs),
+            },
+        );
+        const body: any = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            console.warn(
+                `[read] fire failed: HTTP ${res.status} ${String(body?.error?.message ?? "").slice(0, 200)}`,
+            );
+            return null;
+        }
+        return typeof body?.claude_code_session_url === "string"
+            ? body.claude_code_session_url
+            : null;
+    } catch (e: any) {
+        console.warn(`[read] fire failed: ${String(e?.message ?? e)}`);
+        return null;
+    }
+}
+
+/** The two-deadline wait. Resolves on submit, on fail, or on whichever deadline
+ *  the read misses first. */
+function waitForRead(pending: PendingRead): Promise<ReadOutcome> {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (outcome: ReadOutcome) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(claimTimer);
+            clearTimeout(submitTimer);
+            resolve(outcome);
+        };
+        const claimTimer = setTimeout(() => {
+            if (pending.claimed_at) return; // it turned up; the other deadline owns it now
+            finish({
+                kind: "failed",
+                error: `no agent claimed the read within ${Math.round(cfg.readClaimMs / 1000)}s`,
+            });
+        }, cfg.readClaimMs);
+        const submitTimer = setTimeout(
+            () =>
+                finish({
+                    kind: "failed",
+                    error: `the reading agent did not submit within ${Math.round(cfg.readSubmitMs / 1000)}s of claiming`,
+                }),
+            cfg.readClaimMs + cfg.readSubmitMs,
+        );
+        pending.settle = finish;
+    });
+}
+
+/**
+ * @returns true when a routine actually read the batch and its answer was
+ *          applied. false means "not this time" — the caller reads the frames
+ *          with the model chain instead, and the operator sees which happened.
+ */
+async function readViaRoutine(
+    version: number,
+    note: string,
+    files: string[],
+): Promise<boolean> {
+    if (!cfg.readRoutineId || !cfg.readRoutineToken) return false;
+
+    const pending: PendingRead = {
+        id: `${version}-${Date.now().toString(36)}`,
+        token: crypto.randomUUID(),
+        version,
+        note,
+        count: files.length,
+        files,
+        created_at: Date.now(),
+        claimed_at: null,
+        session_url: null,
+        settle: () => {},
+    };
+    // The wait is armed BEFORE the read is published, because publishing it is
+    // what makes /batch/claim answerable — and the fire below yields to the event
+    // loop, so a fast agent could otherwise claim into a read with no settle.
+    const wait = waitForRead(pending);
+    pendingRead = pending;
+    state.batch.reader = "claude-routine";
+    state.batch.read_state = "queued";
+    saveState();
+    emit("batch_read_queued", { read_id: pending.id, snapshots: pending.count });
+
+    pending.session_url = await fireReadRoutine(
+        `A snapshot batch is waiting to be read: ${pending.count} images, read ${pending.id}. Claim it at /assignment/read/claim.`,
+    );
+    if (pending.session_url) console.log(`[read] ${pending.id} → ${pending.session_url}`);
+
+    const outcome = await wait;
+    pendingRead = null;
+
+    if (outcome.kind === "submitted") {
+        try {
+            applyRead(outcome, version, pending);
+            state.batch.read_state = "submitted";
+            state.batch.reader = "anthropic/claude-routine";
+            return true;
+        } catch (e: any) {
+            // A reset landed mid-read, or the submission merged to nothing. The
+            // frames are still ours, so the chain gets its turn rather than the
+            // batch failing outright.
+            console.warn(`[read] ${pending.id} submission rejected: ${String(e?.message ?? e)}`);
+            emit("batch_read_failed", { read_id: pending.id, error: String(e?.message ?? e) });
+        }
+    } else {
+        console.warn(`[read] ${pending.id} fell back: ${outcome.error}`);
+        emit("batch_read_failed", { read_id: pending.id, error: outcome.error });
+    }
+    state.batch.read_state = pending.claimed_at ? "failed" : "unclaimed";
+    state.batch.reader = null;
+    saveState();
+    return false;
+}
+
+/** Fold a routine's transcription into the live assignment, exactly as a capture
+ *  would be — same merge, same evidence gate, same events. */
+function applyRead(
+    outcome: Extract<ReadOutcome, { kind: "submitted" }>,
+    version: number,
+    pending: PendingRead,
+): void {
+    if (state.version !== version) {
+        throw new Error("assignment was reset during this read");
+    }
+
+    const merge = mergeAssignment(state.assignment, outcome.assignment);
+    state.assignment = merge.merged;
+    state.observations = mergeObservations(state.observations, outcome.observations);
+    state.capture_count += 1;
+    if (outcome.full_page_visible) state.full_page_seen = true;
+    for (const edge of outcome.edges_seen) {
+        if (["top", "bottom", "left", "right"].includes(edge) && !state.edges_seen.includes(edge)) {
+            state.edges_seen.push(edge);
+        }
+    }
+
+    // The live scan also demands all four edges before it believes `done`,
+    // because there it is steering a camera that can still be pointed somewhere
+    // else. A batch has no next frame to ask for: the operator chose these
+    // images and pressed send. Requiring an edge the snapshots never showed
+    // would leave every batch permanently unfinished with no way to say so
+    // except "That's all of it", so the gate here is the one that still means
+    // something — every problem transcribed is a whole problem.
+    const problems = state.assignment.problems ?? [];
+    const allComplete = problems.length > 0 && problems.every((p) => p.complete);
+    state.done = outcome.done && allComplete;
+
+    const log: CaptureLog = {
+        n: state.capture_count,
+        at: new Date().toISOString(),
+        provider: "anthropic",
+        model: "claude-routine",
+        frame_quality: "good",
+        full_page_visible: outcome.full_page_visible,
+        camera_advice: "ok",
+        advice_detail: "",
+        cut_off_edges: [],
+        next_target: state.done ? "" : outcome.notes,
+        next_target_short: state.done ? "" : "Needs another look",
+        region: "batch",
+        observations: outcome.observations,
+        unreadable: [],
+        more_content_beyond: [],
+        changes: merge.kept.length ? [`kept ${merge.kept.join(", ")}`] : [],
+        confidence: 1,
+    };
+    state.captures.push(log);
+    saveState();
+
+    emit("assignment_updated", {
+        capture: log,
+        needs_adjustment: false,
+        done: state.done,
+        source: "claude-routine",
+        read_id: pending.id,
+        problems: problems.length,
+        problems_complete: completeCount(),
+        full_page_seen: state.full_page_seen,
+        edges_seen: state.edges_seen,
+        edges_unseen: ["top", "bottom", "left", "right"].filter(
+            (edge) => !state.edges_seen.includes(edge),
+        ),
+        observations: state.observations,
+        kept: merge.kept.length ? merge.kept : undefined,
+        assignment: state.assignment,
+    });
+    if (state.done) {
+        emit("done", {
+            version: state.version,
+            problems: problems.length,
+            problems_complete: completeCount(),
+        });
+    }
+}
+
+// ── validating what an agent hands back ──────────────────────────────────────
+//
+// The chain's output is schema-constrained by the provider; this isn't. Anything
+// that reaches the merge has to be the right SHAPE or it corrupts the document,
+// so every field is taken deliberately and nothing is spread in wholesale.
+
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+const num = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+function normalizeAssignment(raw: unknown): Assignment {
+    const a = (raw ?? {}) as Record<string, any>;
+    const problems = Array.isArray(a.problems) ? a.problems : [];
+    return {
+        title: str(a.title),
+        subject: str(a.subject),
+        instructions_latex: str(a.instructions_latex),
+        problems: problems
+            .map((p: any) => ({
+                number: str(p?.number).trim(),
+                statement_latex: str(p?.statement_latex),
+                complete: Boolean(p?.complete),
+                clear: p?.clear === undefined ? true : Boolean(p.clear),
+                confidence: p?.confidence === undefined ? 1 : num(p.confidence),
+            }))
+            .filter((p) => p.number && p.statement_latex),
+    };
+}
+
+function normalizeObservations(raw: unknown): Observation[] {
+    if (!Array.isArray(raw)) return [];
+    const spans = ["start", "middle", "end", "whole"];
+    return raw
+        .map((o: any) => ({
+            problem_number: str(o?.problem_number).trim(),
+            line_key: str(o?.line_key).trim(),
+            span: (spans.includes(str(o?.span)) ? str(o?.span) : "whole") as Observation["span"],
+            location: str(o?.location),
+            text_latex: str(o?.text_latex),
+            confidence: o?.confidence === undefined ? 1 : num(o.confidence),
+            clear: o?.clear === undefined ? true : Boolean(o.clear),
+        }))
+        .filter((o) => o.problem_number && o.line_key && o.text_latex);
+}
+
 async function processBatch(): Promise<void> {
     const version = state.version;
     const folder = batchFolder();
@@ -1527,8 +1895,11 @@ async function processBatch(): Promise<void> {
     state.batch.active = false;
     state.batch.processing = true;
     state.batch.finished_at = null;
+    state.batch.error = null;
+    state.batch.reader = null;
+    state.batch.read_state = null;
     saveState();
-    emit("batch_processing", { snapshots: files.length });
+    emit("batch_processing", { snapshots: files.length, batch: state.batch });
     try {
         if (state.version !== version || !files.length) throw new Error("snapshot batch is empty");
         const frames = files.map((file) => readFileSync(file));
@@ -1536,7 +1907,14 @@ async function processBatch(): Promise<void> {
         if (totalBytes > cfg.maxBatchBytes) {
             throw new Error(`snapshot batch is ${(totalBytes / 1e6).toFixed(1)}MB; limit is ${(cfg.maxBatchBytes / 1e6).toFixed(1)}MB`);
         }
-        await doCapture(note, frames);
+        // Claude first, the model chain if it doesn't turn up. The fallback is
+        // not an error path — it is the path this took before the routine
+        // existed, and every reason the routine can miss (unconfigured, never
+        // claimed, submitted nonsense) ends here with the frames still in hand.
+        if (!(await readViaRoutine(version, note, files))) {
+            await doCapture(note, frames);
+            state.batch.reader = lastReader;
+        }
         state.batch.processing = false;
         state.batch.finished_at = new Date().toISOString();
         saveState();
@@ -1948,6 +2326,23 @@ const server = Bun.serve({
                     409,
                 );
             }
+            if (state.batch.active || state.batch.processing) {
+                // The mirror of startBatch's "a live scan is running": whichever
+                // mode got the camera first keeps it. A job started under an open
+                // batch would grab frames the batch is trying to collect, and one
+                // started under a batch READ would collide with doCapture's own
+                // in-progress guard a second later.
+                return json(
+                    {
+                        ok: false,
+                        error: state.batch.active
+                            ? "a snapshot batch is open — send or cancel it first"
+                            : "the snapshot batch is still being read",
+                        batch: state.batch,
+                    },
+                    409,
+                );
+            }
             if (state.done) {
                 // Refusing here beats silently burning a capture to re-confirm: the
                 // caller almost certainly wants /reset first.
@@ -2026,6 +2421,125 @@ const server = Bun.serve({
             }
             void processBatch();
             return json({ ok: true, processing: true, batch: state.batch }, 202);
+        }
+
+        // ---- the reading agent's side of a batch (see readViaRoutine) --------
+        //
+        // Reached from a cloud routine through the document server's
+        // /assignment/read/* proxy, which is what holds this service's token.
+        // Nothing here is for the glasses.
+
+        if (path === "/batch/claim" && req.method === "GET") {
+            const pending = pendingRead;
+            if (!pending) return json({ ok: false, reason: "no_pending_read" });
+            // Claiming twice is a mistake worth naming rather than absorbing: two
+            // agents reading the same batch would both submit, and the second
+            // would be rejected on its token anyway — after spending a session.
+            if (pending.claimed_at) return json({ ok: false, reason: "already_claimed" });
+
+            pending.claimed_at = Date.now();
+            state.batch.read_state = "claimed";
+            saveState();
+            emit("batch_read_claimed", {
+                read_id: pending.id,
+                snapshots: pending.count,
+            });
+            console.log(`[read] ${pending.id} claimed (${pending.count} snapshots)`);
+
+            return json({
+                ok: true,
+                read_id: pending.id,
+                read_token: pending.token,
+                version: pending.version,
+                note: pending.note || null,
+                snapshots: pending.count,
+                /** Fetch each of these, 1..snapshots, and read it as an image. */
+                frame_path: "/assignment/read/frame/{n}",
+                submit_path: "/assignment/read/submit",
+                fail_path: "/assignment/read/fail",
+                /** Submit before this or the model chain takes the batch back. */
+                submit_deadline_ms: cfg.readSubmitMs,
+                /** What already stands, so a re-read improves rather than replaces. */
+                assignment_so_far: state.assignment,
+            });
+        }
+
+        if (path.startsWith("/batch/frame/") && req.method === "GET") {
+            const pending = pendingRead;
+            if (!pending) return json({ ok: false, error: "no read in progress" }, 409);
+            const n = Number(path.slice("/batch/frame/".length));
+            if (!Number.isInteger(n) || n < 1 || n > pending.count) {
+                return json(
+                    { ok: false, error: `frame must be 1..${pending.count}` },
+                    404,
+                );
+            }
+            const file = pending.files[n - 1]!;
+            if (!existsSync(file)) return json({ ok: false, error: "frame is gone" }, 410);
+            return new Response(readFileSync(file), {
+                headers: {
+                    "content-type": "image/jpeg",
+                    "cache-control": "no-store",
+                },
+            });
+        }
+
+        if (path === "/batch/submit" && req.method === "POST") {
+            let body: any = {};
+            try {
+                body = (await req.json()) ?? {};
+            } catch {
+                return json({ ok: false, error: "expected a JSON body" }, 400);
+            }
+            const pending = pendingRead;
+            if (!pending) return json({ ok: false, reason: "no_pending_read" }, 409);
+            // The whole point of the one-time token: this answer is for a read
+            // that has since timed out into the model chain, and landing it now
+            // would overwrite a transcription the operator is already looking at.
+            if (body.read_token !== pending.token) {
+                return json({ ok: false, reason: "stale_token" }, 409);
+            }
+
+            const assignment = normalizeAssignment(body.assignment);
+            if (!assignment.problems.length) {
+                return json(
+                    {
+                        ok: false,
+                        error: "no usable problems: each needs a number and a statement_latex",
+                    },
+                    400,
+                );
+            }
+
+            pending.settle({
+                kind: "submitted",
+                assignment,
+                observations: normalizeObservations(body.observations),
+                done: body.done === undefined ? true : Boolean(body.done),
+                edges_seen: Array.isArray(body.edges_seen)
+                    ? body.edges_seen.map(String)
+                    : [],
+                full_page_visible: Boolean(body.full_page_visible ?? true),
+                notes: String(body.notes ?? "").slice(0, 400),
+            });
+            return json({ ok: true, problems: assignment.problems.length });
+        }
+
+        if (path === "/batch/fail" && req.method === "POST") {
+            let body: any = {};
+            try { body = (await req.json()) ?? {}; } catch { /* empty body is fine */ }
+            const pending = pendingRead;
+            if (!pending) return json({ ok: false, reason: "no_pending_read" }, 409);
+            if (body.read_token !== pending.token) {
+                return json({ ok: false, reason: "stale_token" }, 409);
+            }
+            // Saying so beats going quiet: the batch falls back to the chain now
+            // instead of at the submit deadline, minutes later.
+            pending.settle({
+                kind: "failed",
+                error: String(body.error ?? "the reading agent gave up").slice(0, 300),
+            });
+            return json({ ok: true });
         }
 
         // Stop the background job. Idempotent.
