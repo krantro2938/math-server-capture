@@ -3,8 +3,9 @@
 One project, three directories, two ways to run it. It reads an assignment off
 a physical sheet of paper through a camera, solves it, and shows the working on
 a pair of Even Realities G2 glasses — either **online** (a real camera feed +
-Gemini reads the page, Claude solves it, a VPS renders and serves everything)
-or **offline** (a phone in Termux does all three jobs itself, no internet
+Gemini reads the page, Claude solves it, a second Claude marks the solution and
+sends back what is not good enough, a VPS renders and serves everything) or
+**offline** (a phone in Termux does all three jobs itself, no internet
 required).
 
 ```
@@ -27,6 +28,7 @@ what talks to what, and the order to bring it all up in.
 |---|---|---|
 | Camera reading | `lookcam/run/capture.sh` streams one camera to the VPS, with genuine failover to a second (`CAM_UID_FALLBACK`) if the first stops answering — only one ever pushes to the VPS at a time, see `run/config.env`. A Gemini-backed reader transcribes it live with framing advice. | `lookcam/run/dual_capture.sh` keeps a rolling local JPEG from each of up to two cameras and just serves whichever is freshest — no advice, publish a photo instead (see below) |
 | Solving | A Claude routine (cloud), triggered by a tap | `offline/solver.py`, driving Qwen2.5-Math through Ollama, on the same phone |
+| Checking the answer | A **second** Claude routine (Opus) grades every solution problem by problem and sends the weak ones back to be re-solved, up to three rounds — see `evens/README.md`, "The review loop" | none: one model, one pass |
 | Serving the glasses | `evens/server` (VPS), renders tiles server-side with headless Chromium | `offline/solver.py --serve` on the phone, renders tiles with Pillow (`offline/render.py`, `offline/camera_render.py`) |
 | Switching | `evens/test/src/services/backend.ts` — `auto` picks whichever is reachable, `online`/`offline` pin it. Persisted in the app; changeable from Settings. | |
 

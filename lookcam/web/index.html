@@ -14,9 +14,13 @@
   body { margin: 0; background: #0d0f12; color: #e7e9ee;
          font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
   header { display: flex; align-items: center; gap: 16px; padding: 12px 18px;
-           border-bottom: 1px solid #23262d; position: sticky; top: 0; background: #0d0f12; z-index: 5; }
+           border-bottom: 1px solid #23262d; position: sticky; top: 0; background: #0d0f12; z-index: 5;
+           flex-wrap: wrap; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  .tabs { display: flex; gap: 6px; }
+  /* Wraps rather than overflowing. The strip has been wider than a phone since
+     it reached five tabs — the whole page scrolled sideways and the last tabs
+     were off-screen with nothing to suggest they were there. */
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
   .tab { padding: 7px 14px; border-radius: 8px; border: 1px solid #23262d; background: #14171c;
          color: #c7ccd6; cursor: pointer; font-size: 14px; }
   .tab.active { background: #3b82f6; border-color: #3b82f6; color: #fff; }
@@ -236,6 +240,57 @@
   .copybtn.copied { background: linear-gradient(135deg, #16a34a, #22c55e);
                      box-shadow: 0 1px 0 rgba(255,255,255,.08) inset, 0 6px 16px rgba(22,163,74,.28); }
   @media (max-width: 560px) { .promptgrid { grid-template-columns: 1fr; } }
+
+  /* ---- assignment tab -----------------------------------------------------
+     The transcription as the glasses draw it. Page images are shown at their
+     native 576x252 wherever there is room and never scaled UP: these are a
+     576px-wide panel render, and enlarging them past 1:1 shows you the
+     renderer's antialiasing rather than the document. */
+  /* This tab, and only this tab, escapes main's 1100px cap: two page images at
+     their native 576px need 1170 with the gap, and shrinking them to fit would
+     defeat the whole point of the view — these are a pixel-exact picture of the
+     display, and a resampled one is a picture of the resampler. Below that
+     width the grid drops to a single 1:1 column rather than scaling anything.
+     Where :has() is unsupported that single column is simply the only layout. */
+  main:has(#view-sheet:not(.hidden)) { max-width: 1240px; }
+  .sheetwrap h2 { margin: 0 0 4px; font-size: 17px; }
+  .sheetbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  .sheetbar select { background: #14171c; color: #e7e9ee; border: 1px solid #23262d;
+                     border-radius: 8px; padding: 7px 10px; font-size: 13.5px; }
+  .seg { display: flex; border: 1px solid #23262d; border-radius: 8px; overflow: hidden; }
+  .seg button { padding: 7px 13px; border: 0; background: #14171c; color: #9aa1ad;
+                font-size: 13.5px; cursor: pointer; }
+  .seg button + button { border-left: 1px solid #23262d; }
+  .seg button.on { background: #3b82f6; color: #fff; }
+  /* Fixed 576px tracks, not minmax: a track that can stretch or shrink is a
+     page image at some other size, which is exactly what this view must not
+     show. auto-fill then simply fits as many whole pages as there is room for. */
+  .pagegrid { display: grid; grid-template-columns: repeat(auto-fill, 576px);
+              gap: 18px; justify-content: start; }
+  /* Must out-order `.hidden`, exactly as `#lightbox` does above: both are one
+     class, so the later rule wins and `display: grid` would otherwise keep the
+     page grid on screen underneath the whole-sheet view. */
+  .pagegrid.hidden { display: none; }
+  .pagecard { border: 1px solid #23262d; border-radius: 12px; overflow: hidden;
+              background: #0b0d10; max-width: 576px; }
+  .pagecard img { display: block; width: 100%; max-width: 576px; }
+  .pagecard .pc-bar { display: flex; align-items: center; gap: 10px; padding: 7px 11px;
+                      border-top: 1px solid #1c2027; font-size: 12.5px; color: #8b909a; }
+  .pagecard .pc-bar a { color: #9dc0ff; text-decoration: none; }
+  .pagecard .pc-bar a:hover { text-decoration: underline; }
+  .fullwrap { border: 1px solid #23262d; border-radius: 12px; background: #0b0d10;
+              padding: 12px; overflow-x: auto; }
+  .fullwrap img { display: block; width: 100%; max-width: 576px; margin: 0 auto; }
+  #sheet-empty { color: #8b909a; }
+  /* A phone is narrower than one page, so there the track has to give way — a
+     576px column on a 390px screen is a horizontally-scrolling page, which is
+     worse than a slightly downscaled image. This is the one place the 1:1 rule
+     is traded away, and only where 1:1 will not fit at all. */
+  @media (max-width: 630px) {
+    .pagegrid { grid-template-columns: 1fr; }
+    .sheetbar { gap: 8px; }
+    .sheetbar select { max-width: 100%; }
+  }
 </style>
 </head>
 <body>
@@ -247,6 +302,7 @@
     <button class="tab" data-tab="adri-assignment" id="tab-adri-assignment">Adri task</button>
     <button class="tab" data-tab="adri-solution" id="tab-adri-solution">Adri answer</button>
     <button class="tab" data-tab="photo" id="tab-photo">Photo</button>
+    <button class="tab" data-tab="sheet" id="tab-sheet">Assignment</button>
     <button class="tab" data-tab="prompts" id="tab-prompts">Prompts</button>
   </div>
   <span class="grow"></span>
@@ -361,6 +417,33 @@
         <button class="btn" id="photo-reload">Refresh</button>
         <span class="hint" id="status-photo"></span>
       </div>
+    </div>
+  </section>
+
+  <!-- ASSIGNMENT: the transcription, rendered to images by the document server
+       (evens/server/render/sheet.ts) — the same markdown, the same CSS and the
+       same pagination the glasses get, so "Pages" is literally what is on the
+       display. "Whole sheet" is the same render uncut and at 2x, which is the
+       one worth downloading. The version picker is the reader's scan archive,
+       the same list the glasses' own picker is built from. -->
+  <section id="view-sheet" class="hidden">
+    <div class="sheetwrap">
+      <h2>Assignment, as the glasses see it</h2>
+      <p class="hint">The transcription the reader produced, rendered through the same pipeline the glasses use. <b>Pages</b> is exactly what is on the display, page by page; <b>Whole sheet</b> is the same document uncut, at twice the resolution, for reading here or keeping.</p>
+      <div class="sheetbar">
+        <select id="sheet-version" title="Which scan to render"></select>
+        <div class="seg" id="sheet-mode">
+          <button data-mode="pages" class="on">Pages</button>
+          <button data-mode="full">Whole sheet</button>
+        </div>
+        <a class="btn primary disabled" id="sheet-download" download>Download</a>
+        <button class="btn" id="sheet-reload">Refresh</button>
+        <span class="hint" id="status-sheet"></span>
+      </div>
+      <p class="docmeta" id="meta-sheet">Loading&hellip;</p>
+      <div id="sheet-empty" class="hidden"></div>
+      <div class="pagegrid hidden" id="sheet-pages"></div>
+      <div class="fullwrap hidden" id="sheet-full"><img id="sheet-full-img" alt="the whole assignment, rendered" /></div>
     </div>
   </section>
 
@@ -756,7 +839,7 @@ function updateLiveLag() {
 // a second behind the thing it is measuring.
 setInterval(updateLiveLag, 500);
 
-const VIEWS = ["live", "history", "adri-assignment", "adri-solution", "photo", "prompts"];
+const VIEWS = ["live", "history", "adri-assignment", "adri-solution", "photo", "sheet", "prompts"];
 
 document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => {
   document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
@@ -777,6 +860,7 @@ document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () 
   if (which === "live" || which === "history") mountShots(which);
   if (which.startsWith("adri-")) loadDoc(which);
   if (which === "photo") loadPhoto();
+  if (which === "sheet") loadSheet();
   if (which === "prompts") renderPrompts();
 }));
 
@@ -859,6 +943,137 @@ async function copyPrompt(key, btn) {
 document.querySelectorAll(".copybtn").forEach((b) =>
   b.addEventListener("click", () => copyPrompt(b.dataset.copy, b))
 );
+
+// ---------- the assignment, rendered ----------
+//
+// Two fetches per view: the archive (which scans exist) and the sheet metadata
+// (how many pages this one has). The page images themselves are <img> src's,
+// so the browser fetches them in parallel and caches nothing — the document
+// server renders on demand and coalesces a burst onto one render, which is
+// exactly the shape a grid of six images wants.
+//
+// `t` on every image URL is the sheet's content version, not a timestamp: a
+// scan that has not changed keeps its URLs and the browser's own cache serves
+// the second visit, while a re-scan changes them and the pictures update.
+
+let sheetMode = "pages";
+let sheetScan = "";      // "" = the live scan; otherwise an archived version
+
+function sheetQuery(extra) {
+  const q = new URLSearchParams(extra || {});
+  if (sheetScan) q.set("version", sheetScan);
+  return q;
+}
+
+async function loadSheetVersions() {
+  const sel = $("#sheet-version");
+  try {
+    const res = await fetch("/api/assignment/archive");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const { versions } = await res.json();
+    const list = Array.isArray(versions) ? versions : [];
+    // The live attempt is the head of that list and is deliberately NOT pinned
+    // by number — the reader is still writing to it, so it is selected as ""
+    // and rendered from the live source. Same rule the glasses' picker follows.
+    sel.innerHTML = "";
+    for (const v of list) {
+      const opt = document.createElement("option");
+      opt.value = v.archived ? String(v.version) : "";
+      const title = (v.title || "untitled").slice(0, 40);
+      opt.textContent = `v${v.version} — ${title} · ${v.problems} problem${v.problems === 1 ? "" : "s"}`
+        + (v.archived ? "" : " (live)");
+      sel.appendChild(opt);
+    }
+    if (!list.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "the current scan";
+      sel.appendChild(opt);
+    }
+    sel.value = sheetScan;
+    if (sel.value !== sheetScan) { sheetScan = sel.value; }  // the pinned scan is gone
+  } catch (e) {
+    sel.innerHTML = '<option value="">the current scan</option>';
+  }
+}
+
+async function loadSheet() {
+  const meta = $("#meta-sheet");
+  const empty = $("#sheet-empty");
+  const grid = $("#sheet-pages");
+  const full = $("#sheet-full");
+  const dl = $("#sheet-download");
+  $("#status-sheet").textContent = "";
+  meta.textContent = "Rendering…";
+
+  await loadSheetVersions();
+
+  let info;
+  try {
+    const res = await fetch("/api/assignment/sheet?" + sheetQuery());
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || body.error || body.reason || "HTTP " + res.status);
+    }
+    info = await res.json();
+  } catch (e) {
+    meta.textContent = "";
+    grid.classList.add("hidden");
+    full.classList.add("hidden");
+    empty.classList.remove("hidden");
+    // The usual cause by far: nothing has been transcribed yet, so there is no
+    // document to render. Say that rather than showing a bare error.
+    empty.textContent = "Could not render the assignment: " + e.message
+      + ". If nothing has been scanned or photographed yet, there is no transcription to draw.";
+    dl.classList.add("disabled");
+    dl.removeAttribute("href");
+    return;
+  }
+
+  empty.classList.add("hidden");
+  meta.textContent = `Scan v${info.scan} · ${info.pages} page${info.pages === 1 ? "" : "s"} on the glasses `
+    + `· whole sheet ${info.full_width}×${info.full_height} at ${info.scale}× `
+    + `(${Math.round(info.bytes / 1024)} kB)`;
+
+  const q = sheetQuery({ t: String(info.version), download: "1" });
+  dl.href = "/api/assignment/sheet.png?" + q;
+  dl.classList.remove("disabled");
+
+  grid.innerHTML = "";
+  for (let i = 0; i < info.pages; i++) {
+    const view = sheetQuery({ t: String(info.version) });
+    const save = sheetQuery({ t: String(info.version), download: "1" });
+    const card = document.createElement("div");
+    card.className = "pagecard";
+    card.innerHTML = `<img loading="lazy" alt="page ${i + 1} of the assignment" `
+      + `src="/api/assignment/sheet/${i}.png?${view}" />`
+      + `<div class="pc-bar"><span>Page ${i + 1} of ${info.pages}</span>`
+      + `<span class="grow"></span>`
+      + `<a href="/api/assignment/sheet/${i}.png?${save}" download>Save</a></div>`;
+    grid.appendChild(card);
+  }
+
+  $("#sheet-full-img").src = "/api/assignment/sheet.png?" + sheetQuery({ t: String(info.version) });
+  applySheetMode();
+}
+
+function applySheetMode() {
+  const pages = sheetMode === "pages";
+  $("#sheet-pages").classList.toggle("hidden", !pages);
+  $("#sheet-full").classList.toggle("hidden", pages);
+  document.querySelectorAll("#sheet-mode button").forEach((b) =>
+    b.classList.toggle("on", b.dataset.mode === sheetMode)
+  );
+}
+
+document.querySelectorAll("#sheet-mode button").forEach((b) =>
+  b.addEventListener("click", () => { sheetMode = b.dataset.mode; applySheetMode(); })
+);
+$("#sheet-version").addEventListener("change", (e) => {
+  sheetScan = e.target.value;
+  loadSheet();
+});
+$("#sheet-reload").addEventListener("click", loadSheet);
 
 // ---------- the published photo ----------
 //

@@ -179,6 +179,29 @@ per-browser, survive reloads, and never reach the VPS. Click one to open it
 full size (arrow keys to move, `Esc` to close), where it can also be downloaded
 or deleted; `Clear all` empties the store.
 
+### Assignment — the transcription, as the glasses see it
+
+The **Assignment** tab shows what the reader actually made of the sheet, drawn
+by the document server's own renderer rather than described in text:
+
+- **Pages** — one image per page of the glasses display, at its native 576×252.
+  Same layout, same greys, same overlapping rows between pages. It is a
+  pixel-exact picture of what is on the panel, which is why the images are never
+  scaled up and only ever scaled down where a phone leaves no room for 1:1.
+- **Whole sheet** — the same render uncut and at 2×, for reading here. The
+  **Download** button saves it as `assignment-v<scan>-<date>.png`; each page has
+  its own **Save** too.
+- The picker lists the reader's scan archive, so an earlier attempt can be
+  rendered without pointing the camera at the paper again. The live scan is the
+  head of the list and follows the camera; the rest are fixed.
+
+This is the tab for *reading the transcription before spending a solve on it* —
+the glasses can show it, but not at a size or on a screen where checking it is
+pleasant. Everything is proxied through this gateway (`/api/assignment/sheet*`,
+session-gated) because the document server has no login of its own; the proxy is
+a **whitelist**, not a wildcard forward, since `/assignment/*` over there also
+holds the camera controls and the photo-publish endpoint.
+
 ## Running unattended
 
 The capture side is built to be started before the camera even exists and left

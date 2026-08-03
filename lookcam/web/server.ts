@@ -10,6 +10,9 @@
 //                  dashboard, a cron job) asks HTTP instead of speaking RTSP
 //   - photo:       GET /api/photo[/meta] -> the sheet last published from the
 //                  companion app, shown and downloaded in the Photo tab
+//   - assignment:  GET /api/assignment/sheet[.png] -> the transcription as the
+//                  glasses render it, page by page and as one downloadable
+//                  image; /archive lists the earlier scans to pick between
 //
 // Run with Bun:   bun run server.ts   (or `bun run start`)
 // Configure via env (see .env.example). Nothing here is camera-specific.
@@ -556,6 +559,43 @@ Bun.serve({
           headers.set("content-disposition", `attachment; filename="${downloadName(url, type)}"`);
         }
         return new Response(upstream.body, { headers });
+      } catch (e: any) {
+        return Response.json(
+          { ok: false, reason: `document server unreachable: ${e?.message ?? e}` },
+          { status: 502 },
+        );
+      }
+    }
+
+    // --- the assignment, rendered to images -------------------------------
+    //
+    // What the Assignment tab shows: the transcription as the glasses draw it,
+    // one PNG per page, plus the whole document in a single tall image to
+    // download. The document server does the rendering (see render/sheet.ts
+    // over there); this is a session-gated pipe to it, like /api/doc and
+    // /api/photo.
+    //
+    // A WHITELIST, not a wildcard forward. /assignment/* over there also holds
+    // the camera controls and the photo publish endpoint, and this app is the
+    // one thing with a password in front of it — a generic proxy would quietly
+    // put "start the camera" and "replace the assignment" on a URL nobody
+    // reviewed. Adding a route here should be a decision each time.
+    const sheet = /^\/api\/assignment\/(sheet|sheet\.png|sheet\/\d+\.png|archive|status)$/.exec(path);
+    if (sheet && req.method === "GET") {
+      const upstream = `${CFG.evensUrl}/assignment/${sheet[1]}${url.search}`;
+      try {
+        const res = await fetch(upstream, { signal: AbortSignal.timeout(60000) });
+        // Images stream through; JSON is small enough to read. Either way the
+        // upstream's own content-type and disposition are what the browser
+        // needs — the download filename is decided over there, next to the
+        // scan number it names.
+        const headers = new Headers({
+          "content-type": res.headers.get("content-type") ?? "application/octet-stream",
+          "cache-control": "no-store",
+        });
+        const disposition = res.headers.get("content-disposition");
+        if (disposition) headers.set("content-disposition", disposition);
+        return new Response(res.body, { status: res.status, headers });
       } catch (e: any) {
         return Response.json(
           { ok: false, reason: `document server unreachable: ${e?.message ?? e}` },
