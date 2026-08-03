@@ -19,6 +19,7 @@ echo "--- Installing system packages ---"
 pkg update -y
 pkg install -y \
   python \
+  python-pip \
   python-pillow \
   cmake \
   clang \
@@ -80,7 +81,10 @@ fi
 
 echo ""
 echo "--- Installing Python packages ---"
-pip install --upgrade pip
+# NB: do NOT `pip install --upgrade pip` on Termux — it refuses outright
+# ("Installing pip is forbidden, this will break the python-pip package"),
+# and under `set -e` that aborts the whole setup. pip is managed by the
+# python-pip package; install the libraries directly.
 pip install sympy mpmath requests
 
 # Verify SymPy works.
