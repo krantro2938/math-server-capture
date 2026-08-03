@@ -10,6 +10,11 @@
 
 set -euo pipefail
 
+# Resolve our own directory once, before anything cd's elsewhere — invoked as
+# `bash offline/setup-termux.sh`, $0 is relative and stops resolving the moment
+# the llama.cpp build changes directory.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 echo "=== Offline solver setup for Termux ==="
 echo ""
 
@@ -99,7 +104,7 @@ print('SymPy OK: solve(x²-4) =', result)
 # Verify the tile renderer (Pillow + matplotlib mathtext) works.
 python3 -c "
 import sys
-sys.path.insert(0, '$(cd "$(dirname "$0")" && pwd)')
+sys.path.insert(0, '$SCRIPT_DIR')
 import render
 assert render.RENDER_AVAILABLE, 'Pillow/matplotlib not importable'
 pages = render.render_markdown_to_tiles('## 1\n\nSolve \$x^2=4\$: **Ответ: \$x=\\\\pm 2\$**')
@@ -111,7 +116,7 @@ print('Renderer OK:', len(pages), 'page(s)')
 # GET /assignment/camera in solver.py, fed by lookcam/run/dual_capture.sh.
 python3 -c "
 import io, sys
-sys.path.insert(0, '$(cd "$(dirname "$0")" && pwd)')
+sys.path.insert(0, '$SCRIPT_DIR')
 from PIL import Image
 import camera_render as cr
 assert cr.CAMERA_RENDER_AVAILABLE, 'Pillow not importable'
@@ -219,7 +224,7 @@ echo ""
 
 # ── config ──────────────────────────────────────────────────────────────────
 
-CONFIG_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_DIR="$SCRIPT_DIR"
 CONFIG_LOCAL="$CONFIG_DIR/config.local.env"
 
 if [ ! -f "$CONFIG_LOCAL" ]; then
