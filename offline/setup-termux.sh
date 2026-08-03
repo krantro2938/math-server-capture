@@ -24,9 +24,33 @@ pkg install -y \
   clang \
   make \
   git \
-  curl \
-  vulkan-headers \
-  vulkan-loader-android
+  curl
+
+# Vulkan is an optimisation, not a requirement — llama.cpp runs CPU-only
+# without it. Keep it in its own transaction: `vulkan-loader-android` pulls in
+# `vulkan-icd`, which insists on a driver package (mesa swrast, freedreno,
+# swiftshader) that some mirrors cannot resolve, and apt then aborts the whole
+# install — taking cmake and python-pillow down with it.
+VULKAN_OK=0
+echo ""
+echo "--- Installing Vulkan (optional) ---"
+if pkg install -y vulkan-headers vulkan-loader-android 2>&1; then
+  VULKAN_OK=1
+else
+  echo "Vulkan packages unavailable — continuing with a CPU-only build."
+  echo "  (Retry later after 'termux-change-repo'; a lagging mirror is the"
+  echo "   usual cause. Nothing else in the setup depends on this.)"
+fi
+
+# Trust the files, not the exit code: apt can report success while leaving the
+# loader out, and a build configured for Vulkan then fails at link time.
+if [ "$VULKAN_OK" = 1 ]; then
+  prefix="${PREFIX:-/data/data/com.termux/files/usr}"
+  if [ ! -f "$prefix/include/vulkan/vulkan.h" ] || [ ! -f "$prefix/lib/libvulkan.so" ]; then
+    echo "Vulkan headers/loader missing despite install — falling back to CPU-only."
+    VULKAN_OK=0
+  fi
+fi
 
 # matplotlib is not in termux-main — it was dropped because it needs a full
 # C/C++ + freetype build for every Python minor version. It lives in the
@@ -99,7 +123,11 @@ print('Camera renderer OK:', len(result['tiles']), 'tiles, contrast=', result['c
 LLAMA_DIR="$HOME/llama.cpp"
 
 echo ""
-echo "--- Building llama.cpp with Vulkan ---"
+if [ "$VULKAN_OK" = 1 ]; then
+  echo "--- Building llama.cpp with Vulkan ---"
+else
+  echo "--- Building llama.cpp (CPU-only, no Vulkan) ---"
+fi
 
 if [ -d "$LLAMA_DIR" ]; then
   echo "llama.cpp already exists at $LLAMA_DIR — pulling latest"
@@ -110,9 +138,11 @@ else
   cd "$LLAMA_DIR"
 fi
 
-cmake -B build \
-  -DGGML_VULKAN=ON \
-  -DCMAKE_BUILD_TYPE=Release
+if [ "$VULKAN_OK" = 1 ]; then
+  cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+else
+  cmake -B build -DGGML_VULKAN=OFF -DCMAKE_BUILD_TYPE=Release
+fi
 
 cmake --build build -j4 --target llama-server
 
@@ -201,6 +231,12 @@ fi
 echo ""
 echo "=== Setup complete ==="
 echo ""
+if [ "$VULKAN_OK" != 1 ]; then
+  echo "NOTE: llama.cpp was built without Vulkan — GPU offload is unavailable."
+  echo "      Set OCR_GPU_LAYERS=0 and SOLVER_GPU_LAYERS=0 in config.local.env,"
+  echo "      or the server will try to offload layers it cannot use."
+  echo ""
+fi
 echo "Next steps:"
 echo "  1. Download the two model files to $MODELS_DIR"
 echo "  2. Edit $CONFIG_LOCAL (set SOLVER_TOKEN, verify paths)"
