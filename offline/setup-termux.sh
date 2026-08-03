@@ -222,6 +222,42 @@ echo "  Download from huggingface.co — search for the GGUF quantized versions.
 echo "  Total: ~4 GB of storage."
 echo ""
 
+# ── the study pack ──────────────────────────────────────────────────────────
+#
+# content/enc is the offline encyclopedia: ~4 MB of pre-rendered pages that
+# encyclopedia.py serves as static bytes (see its module docstring). It lives
+# in the `evens` submodule because that is where it is BUILT, and a shallow
+# clone of this repo does not check submodules out — so without this step the
+# glasses reach /enc/toc, get a 503, and the encyclopedia is simply absent with
+# nothing saying why.
+
+echo ""
+echo "--- Study pack (offline encyclopedia) ---"
+
+ENC_FOUND=""
+for candidate in "$SCRIPT_DIR/content/enc" "$SCRIPT_DIR/../evens/content/enc"; do
+  [ -f "$candidate/toc.json.gz" ] && ENC_FOUND="$candidate" && break
+done
+
+if [ -z "$ENC_FOUND" ] && [ -d "$SCRIPT_DIR/../.git" ]; then
+  echo "Not checked out — fetching the evens submodule…"
+  # Never fatal: the solver's real job is solving, and it starts fine without
+  # a study pack. A phone that is out of space should still get a working
+  # solver and a clear line saying what it did not get.
+  if git -C "$SCRIPT_DIR/.." submodule update --init --depth 1 evens 2>/dev/null; then
+    [ -f "$SCRIPT_DIR/../evens/content/enc/toc.json.gz" ] &&
+      ENC_FOUND="$SCRIPT_DIR/../evens/content/enc"
+  fi
+fi
+
+if [ -n "$ENC_FOUND" ]; then
+  echo "Study pack: $(du -sh "$ENC_FOUND" 2>/dev/null | cut -f1) at $ENC_FOUND"
+else
+  echo "Study pack: NOT FOUND — /enc/* will return 503 and the Encyclopedia"
+  echo "            page on the glasses will be empty. Fix with:"
+  echo "              git -C $(cd "$SCRIPT_DIR/.." && pwd) submodule update --init --depth 1 evens"
+fi
+
 # ── config ──────────────────────────────────────────────────────────────────
 
 CONFIG_DIR="$SCRIPT_DIR"

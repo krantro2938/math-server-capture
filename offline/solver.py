@@ -42,6 +42,14 @@ try:
 except ImportError:
     render = None
 
+# Optional the same way render is: setup-termux.sh copies these files onto the
+# phone one by one, and a solver that refuses to start because the study pack
+# was not copied would take the whole offline stack down with it.
+try:
+    import encyclopedia
+except ImportError:
+    encyclopedia = None
+
 try:
     import camera_render
 except ImportError:
@@ -920,6 +928,11 @@ def _query_int(path: str, key: str) -> int | None:
         return None
 
 
+def _query_str(path: str, key: str) -> str:
+    """?key=... from a request path, or "" when it is absent."""
+    return parse_qs(urlparse(path).query).get(key, [""])[0]
+
+
 def _query_solution_id(path: str) -> int | None:
     """?solution_id=N from a request path, if it is there and is a number."""
     return _query_int(path, "solution_id")
@@ -1075,6 +1088,24 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _packed(self, body: bytes):
+        """A pre-gzipped file, straight through.
+
+        Declares the encoding instead of compressing an already-compressed body
+        a second time. The client's fetch() unwraps it, so nothing on the phone
+        ever holds the decompressed JSON.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        # Immutable by construction: a node's content hash IS its version, so a
+        # stale copy cannot happen.
+        self.send_header("Cache-Control", "public, max-age=604800, immutable")
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors()
@@ -1167,6 +1198,26 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
                     time.sleep(5)
             except (BrokenPipeError, ConnectionResetError):
                 return
+
+        # ── the encyclopedia ────────────────────────────────────────────────
+        #
+        # Two routes that only read files, mirroring evens/server/enc.ts byte
+        # for byte. Nothing here renders, nothing here is live, and the client
+        # cannot tell which of the two servers answered — which is what makes
+        # the encyclopedia work with the network off. See encyclopedia.py.
+
+        if path == "/enc/toc":
+            body = encyclopedia.toc() if encyclopedia else None
+            if body is None:
+                return self._json(503, {"error": "enc_not_packed"})
+            return self._packed(body)
+
+        if path == "/enc/node":
+            node_id = _query_str(self.path, "id")
+            body = encyclopedia.node(node_id) if encyclopedia else None
+            if body is None:
+                return self._json(404, {"error": "not_found", "id": node_id})
+            return self._packed(body)
 
         self._json(404, {"ok": False, "detail": "not found"})
 
@@ -1765,6 +1816,8 @@ def serve(host: str, port: int, llama_url: str):
     server.daemon_threads = True
     print(f"[serve] listening on http://{host}:{port}", file=sys.stderr)
     print(f"[serve] llama: {llama_url}  model: {OLLAMA_MODEL or '(llama.cpp)'}", file=sys.stderr)
+    if encyclopedia:
+        print(f"[serve] {encyclopedia.describe()}", file=sys.stderr)
     if CAMERA_SNAPSHOT_PRIMARY or CAMERA_SNAPSHOT_FALLBACK:
         print(f"[serve] camera: primary={CAMERA_SNAPSHOT_PRIMARY or '(none)'} "
               f"fallback={CAMERA_SNAPSHOT_FALLBACK or '(none)'}", file=sys.stderr)
