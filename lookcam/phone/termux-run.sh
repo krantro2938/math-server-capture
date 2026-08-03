@@ -12,6 +12,12 @@
 #   3. this script        — restarts capture.sh if it dies for any reason at all
 #                           (OOM kill, Termux restart, config typo, ffmpeg crash)
 #
+# Layers 1-3 all key off something EXITING. A hang exits nothing, so each layer
+# also has to convert silence into an exit: lookcam_stream.py drops a session
+# that stops producing video, capture.sh rebuilds a pipeline that stops muxing
+# it, and this script kills a capture.sh that stops reporting progress at all
+# (see supervise_capture).
+#
 #   bash ~/lookcam/phone/termux-run.sh          # run it by hand (Ctrl-C to stop)
 #   bash ~/lookcam/phone/termux-run.sh --force  # ...taking over from whatever is
 #                                               #    already streaming
@@ -25,6 +31,15 @@ LOG="${LOG:-$HOME/lookcam.log}"
 MAX_LOG_BYTES=${MAX_LOG_BYTES:-5000000}     # rotate at ~5 MB, keep one old copy
 RESTART_DELAY=${RESTART_DELAY:-5}
 PIDFILE="${PIDFILE:-$HOME/.lookcam.pid}"
+# run/capture.sh touches this whenever it is demonstrably making progress; see
+# supervise_capture() for why waiting on the process alone is not enough.
+# Exported because capture.sh has to agree with us on the path.
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-$HOME/.lookcam.heartbeat}"; export HEARTBEAT_FILE
+HEARTBEAT_MAX=${HEARTBEAT_MAX:-180}
+# Kept short because it is also the latency added to a NORMAL restart: the loop
+# below only notices capture.sh exiting on its next tick, and an exit is the
+# common case (camera drop, ffmpeg death) that used to be handled instantly.
+SUPERVISOR_POLL=${SUPERVISOR_POLL:-5}
 
 FORCE=0
 case "${1:-}" in
@@ -198,9 +213,65 @@ wait_for_network() {
   log "no interface detected after ${max}s — starting anyway"
 }
 
+# Is $1 a live process, as opposed to an exited one we have not reaped yet?
+# `kill -0` cannot answer this: it succeeds on zombies, so a loop built on it
+# would keep "supervising" a capture.sh that finished seconds ago. Field 3 of
+# /proc/<pid>/stat is the state letter; comm (field 2) can contain spaces, so
+# cut past its closing paren rather than counting fields.
+child_alive() {
+  local line st
+  line="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  st="${line##*) }"; st="${st%% *}"
+  [ -n "$st" ] && [ "$st" != "Z" ]
+}
+
+# Wait for the capture pipeline, but treat silence as a fault.
+#
+# `wait $CAPTURE_PID` on its own is a bet that every fault below eventually
+# becomes an exit — and it isn't one. A camera that answers discovery but never
+# sends video (OpenVideo refused, another client attached, a resync it never
+# finished) leaves lookcam_stream.py alive and mute; ffmpeg then blocks reading
+# the FIFO with no -timeout to save it; capture.sh blocks in `wait -n`; and we
+# block here, forever, still holding the wake lock and the pidfile — which also
+# means acquire_lock refuses a plain restart, because it correctly sees a live
+# supervisor and a live pipeline. Only a reboot or --force got out of that.
+#
+# lookcam_stream.py's own watchdog now catches that specific case. This is the
+# general backstop: if capture.sh stops reporting progress at all, restart it,
+# whatever the reason. Enforcement ARMS only after the child's first beat, so an
+# old capture.sh without heartbeats (a half-finished deploy) is left alone
+# rather than being killed every HEARTBEAT_MAX seconds forever.
+supervise_capture() {
+  local started="$1" armed=0 stamp age waited
+  while child_alive "$CAPTURE_PID"; do
+    nap "$SUPERVISOR_POLL"
+    stamp="$(stat -c %Y "$HEARTBEAT_FILE" 2>/dev/null)"
+    [ -z "$stamp" ] && continue          # no heartbeat yet, or no usable stat
+    if [ "$armed" = 0 ]; then
+      [ "$stamp" -gt "$started" ] && armed=1
+      continue
+    fi
+    age=$(( $(date +%s) - stamp ))
+    [ "$age" -lt "$HEARTBEAT_MAX" ] && continue
+
+    log "capture pipeline silent for ${age}s (limit ${HEARTBEAT_MAX}s) — killing it"
+    # Grandchildren too: killing only capture.sh is how an orphan that keeps
+    # publishing to the VPS gets left behind, and here it would be a HUNG one,
+    # which acquire_lock would then see as a live pipeline.
+    kill $(pgrep -P "$CAPTURE_PID" 2>/dev/null) "$CAPTURE_PID" 2>/dev/null
+    waited=0
+    while child_alive "$CAPTURE_PID" && [ "$waited" -lt 10 ]; do nap 1; waited=$((waited + 1)); done
+    child_alive "$CAPTURE_PID" &&
+      kill -9 $(pgrep -P "$CAPTURE_PID" 2>/dev/null) "$CAPTURE_PID" 2>/dev/null
+    return 0
+  done
+}
+
 main() {
   log "supervisor starting (repo=$REPO)"
   wait_for_network
+  [ -r "/proc/$$/stat" ] ||
+    log "warning: /proc is unreadable — cannot detect a hung capture pipeline"
   while true; do
     rotate_log
     log "starting capture pipeline"
@@ -210,8 +281,10 @@ main() {
     # what lets cleanup() guarantee we never leave an orphaned capture.sh behind
     # streaming to the VPS with no supervisor — the failure mode that made a
     # dead-looking phone keep publishing.
+    STARTED_AT="$(date +%s)"
     bash "$REPO/run/capture.sh" &
     CAPTURE_PID=$!
+    supervise_capture "$STARTED_AT"
     wait "$CAPTURE_PID"
     rc=$?
     CAPTURE_PID=""

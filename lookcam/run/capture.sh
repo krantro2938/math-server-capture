@@ -45,9 +45,30 @@ if [ -f "$CONF" ]; then . "$CONF"; else echo "[!] missing $CONF"; exit 1; fi
 # see the failover note above. Empty CAM_UID_FALLBACK (the default) disables
 # the feature entirely: find_camera() behaves exactly as it always has.
 : "${CAM_UID_FALLBACK:=}"   ; : "${FAILOVER_RECHECK:=60}"
+# Liveness. Every layer of this stack converts a fault into an exit, which is
+# why the retry chain works — but nothing converted a SILENCE into an exit, so
+# any hang below the supervisor was invisible and permanent. HEARTBEAT_FILE is
+# touched whenever this script is demonstrably making progress (searching for a
+# camera, or ffmpeg reporting muxed video); phone/termux-run.sh watches its
+# mtime as a backstop, and PIPELINE_STALL below is our own faster self-heal.
+: "${HEARTBEAT_FILE:=${HOME:-${TMPDIR:-/tmp}}/.lookcam.heartbeat}"
+: "${PIPELINE_STALL:=45}"   ; : "${HEARTBEAT_POLL:=5}"
 
 PYTHON="./.venv/bin/python"; [ -x "$PYTHON" ] || PYTHON="python3"
 command -v ffmpeg >/dev/null || { echo "[!] ffmpeg not installed"; exit 1; }
+
+beat() { : > "$HEARTBEAT_FILE" 2>/dev/null; }
+mtime() { stat -c %Y "$1" 2>/dev/null; }
+
+# A watchdog that cannot read a clock is worse than no watchdog: every check
+# would read "stalled" and it would restart a perfectly healthy pipeline every
+# PIPELINE_STALL seconds, forever. `stat -c` is GNU/toybox, and this also runs
+# on whatever busybox a phone ships, so prove it works here before arming.
+beat
+if [ -z "$(mtime "$HEARTBEAT_FILE")" ]; then
+  echo "[!] stat(1) cannot report mtimes here — pipeline stall watchdog disabled" >&2
+  PIPELINE_STALL=0
+fi
 
 # The :? guards above only catch an *empty* value — and run/config.env ships a
 # CHANGE_ME placeholder, so they never fired. The result was the worst possible
@@ -139,6 +160,10 @@ find_camera() {
       fi
     fi
 
+    # Searching IS progress: a camera can be unplugged for a week and this loop
+    # is the correct behaviour, so keep the heartbeat fresh or the supervisor
+    # would restart us every few minutes throughout a genuine camera outage.
+    beat
     echo "[.] no camera on the network yet (attempt $try) — retrying in ${DISCOVER_RETRY}s..." >&2
     sleep "$DISCOVER_RETRY"
   done
@@ -163,6 +188,45 @@ watch_primary() {
   done
 }
 
+# Turn ffmpeg's -progress stream into heartbeats. A plain `-progress <file>`
+# APPENDS a ~400-byte block twice a second forever — tens of MB a day onto a
+# phone's flash for a stream that is supposed to run for months — so read it
+# through a fifo and keep nothing. Blocks when ffmpeg stops muxing, which is
+# precisely the signal: no beat, and watch_stall below ends the round.
+read_progress() {
+  local line
+  # Reopened in a loop: a read side that fell out on EOF while ffmpeg was still
+  # running would stop beating, and the stall watchdog below would then shoot a
+  # perfectly healthy pipeline. Real ffmpeg holds the progress fd open for its
+  # whole life, so in practice EOF means it exited — and then the round is over
+  # anyway and cleanup kills us.
+  while true; do
+    while IFS= read -r line; do
+      case "$line" in progress=*) beat ;; esac
+    done < "$1"
+    sleep 1
+  done
+}
+
+# The stall detector proper. Ends the round (and so, via `wait -n`, restarts the
+# pipeline) when nothing has beaten for PIPELINE_STALL seconds. The round's own
+# start time is the floor, so the first-frame grace period is PIPELINE_STALL
+# rather than zero — discovery is already done by here, but login + OpenVideo +
+# keyframe still takes a few seconds.
+watch_stall() {
+  local start="$1" ref stamp now
+  while true; do
+    sleep "$HEARTBEAT_POLL"
+    stamp="$(mtime "$HEARTBEAT_FILE")"; : "${stamp:=0}"
+    ref="$stamp"; [ "$start" -gt "$ref" ] && ref="$start"
+    now="$(date +%s)"
+    if [ "$((now - ref))" -ge "$PIPELINE_STALL" ]; then
+      echo "[!] no video muxed for ${PIPELINE_STALL}s — the pipeline is hung, restarting it" >&2
+      return 0
+    fi
+  done
+}
+
 echo "[*] capture: primary=${CAM_UID:-any} fallback=${CAM_UID_FALLBACK:-none} ip=${CAMERA_IP} stream=${STREAM} -> ${VPS_HOST} (${MODE})"
 
 # A plain `python … | ffmpeg …` only completes when BOTH ends exit, so half a
@@ -172,11 +236,15 @@ echo "[*] capture: primary=${CAM_UID:-any} fallback=${CAM_UID_FALLBACK:-none} ip
 # stayed down until someone noticed by hand. Run the two as explicit jobs
 # instead, wait for whichever dies first, and take the survivor with it.
 FIFO=""
+PROGRESS=""
 cleanup() {
   [ -n "${PY_PID:-}" ] && kill "$PY_PID" 2>/dev/null
   [ -n "${FF_PID:-}" ] && kill "$FF_PID" 2>/dev/null
   [ -n "${WATCH_PID:-}" ] && kill "$WATCH_PID" 2>/dev/null
+  [ -n "${PROG_PID:-}" ] && kill "$PROG_PID" 2>/dev/null
+  [ -n "${STALL_PID:-}" ] && kill "$STALL_PID" 2>/dev/null
   [ -n "$FIFO" ] && rm -f "$FIFO"
+  [ -n "$PROGRESS" ] && rm -f "$PROGRESS"
 }
 trap 'cleanup; exit 0' INT TERM
 
@@ -186,6 +254,19 @@ while true; do
 
   FIFO="$(mktemp -u "${TMPDIR:-/tmp}/lookcam.XXXXXX")"
   mkfifo "$FIFO" || { echo "[!] cannot create fifo"; sleep 5; continue; }
+
+  # Started before ffmpeg on purpose: opening a fifo write-side blocks until a
+  # reader is there, so ffmpeg would hang in option parsing without this.
+  PROG_PID=""
+  if [ "$PIPELINE_STALL" -gt 0 ]; then
+    PROGRESS="$(mktemp -u "${TMPDIR:-/tmp}/lookcam-prog.XXXXXX")"
+    if mkfifo "$PROGRESS"; then
+      read_progress "$PROGRESS" & PROG_PID=$!
+    else
+      echo "[!] cannot create progress fifo — stall watchdog off this round" >&2
+      PROGRESS=""
+    fi
+  fi
 
   "$PYTHON" lookcam_stream.py -a "$CAM_ADDR" -p "$CAM_PASS" --stream "$STREAM" --pipe \
     > "$FIFO" &
@@ -198,15 +279,24 @@ while true; do
   # every camera drop, every re-find, every supervisor retry — so it is really a
   # recurring one. Raw HEVC needs only the first VPS/SPS/PPS + a frame to be
   # probed, which fits in far less than 200KB.
+  PROGRESS_ARGS=()
+  [ -n "$PROGRESS" ] && PROGRESS_ARGS=(-progress "$PROGRESS")
   ffmpeg -hide_banner -loglevel warning \
       -fflags +genpts+nobuffer -flags low_delay \
       -probesize 200000 -analyzeduration 200000 \
       -use_wallclock_as_timestamps 1 \
+      "${PROGRESS_ARGS[@]}" \
       -f hevc -i "$FIFO" "${PUSH[@]}" &
   FF_PID=$!
 
   WAIT_PIDS=("$PY_PID" "$FF_PID")
   WATCH_PID=""
+  STALL_PID=""
+  if [ -n "$PROGRESS" ]; then
+    watch_stall "$(date +%s)" &
+    STALL_PID=$!
+    WAIT_PIDS+=("$STALL_PID")
+  fi
   # Only worth watching for something better while we're already on the worse
   # option — streaming the primary already IS the preferred outcome, so a
   # watcher here would have nothing to switch to and would never fire.
@@ -216,14 +306,16 @@ while true; do
     WAIT_PIDS+=("$WATCH_PID")
   fi
 
-  # Whichever exits first — camera drop, SRT death, OOM, a hang we SIGTERM, or
-  # (on the fallback) the primary coming back — ends the round. Then kill the
-  # rest so we never leak a half-pipeline or a watcher with nothing left to watch.
+  # Whichever exits first — camera drop, SRT death, OOM, a hang the stall
+  # watchdog caught, or (on the fallback) the primary coming back — ends the
+  # round. Then kill the rest so we never leak a half-pipeline or a watcher
+  # with nothing left to watch.
   wait -n "${WAIT_PIDS[@]}" 2>/dev/null
-  kill "${WAIT_PIDS[@]}" 2>/dev/null
-  wait "${WAIT_PIDS[@]}" 2>/dev/null
-  rm -f "$FIFO"; FIFO=""; PY_PID=""; FF_PID=""; WATCH_PID=""
+  kill "${WAIT_PIDS[@]}" ${PROG_PID:+"$PROG_PID"} 2>/dev/null
+  wait "${WAIT_PIDS[@]}" ${PROG_PID:+"$PROG_PID"} 2>/dev/null
+  rm -f "$FIFO" ${PROGRESS:+"$PROGRESS"}
+  FIFO=""; PROGRESS=""; PY_PID=""; FF_PID=""; WATCH_PID=""; STALL_PID=""; PROG_PID=""
 
-  echo "[!] pipeline exited (camera/network drop, or a better camera came back). re-finding in 3s..."
+  echo "[!] pipeline exited (camera/network drop, a hung pipeline, or a better camera came back). re-finding in 3s..."
   sleep 3
 done

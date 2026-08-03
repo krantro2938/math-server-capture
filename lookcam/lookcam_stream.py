@@ -57,7 +57,8 @@ MUX_END = b"\xf4\xf3\xf2\xf1"
 CMD_HDR = bytes.fromhex("00036714646a") + b"\x00" * 12   # 18B; camera doesn't validate it
 VID_MARK = b"\x01\xaf\xaf\xaf"
 HEVC_VPS = b"\x00\x00\x00\x01\x40"   # HEVC VPS NAL — marks a keyframe boundary
-STALL_SECONDS = 12
+STALL_SECONDS = 12      # streaming, then nothing downstream this long = dead
+ACQUIRE_SECONDS = 30    # connected, but never yet produced anything playable
 
 
 class StreamSession(JsonSession):
@@ -70,12 +71,15 @@ class StreamSession(JsonSession):
         self._stream = stream
         self._on_video = on_video       # callback(bytes) for each HEVC frame
         self._started = False           # gated until first keyframe (VPS)
+        self._emitted = False           # has this session EVER emitted a frame
+        self._dropped = False           # watchdog already fired
         self.userid = 0
         self.frames = 0
         self.vbytes = 0
         self.gaps = 0                   # lost-packet resyncs
         self._expect = None             # next expected video DRW idx
-        self.last_video = time.monotonic()
+        self.last_video = time.monotonic()   # last video DRW packet from the cam
+        self.last_emit = time.monotonic()    # last frame handed downstream
 
     async def _send_cmd(self, obj):
         js = json.dumps(obj, separators=(",", ":")).encode()
@@ -96,9 +100,43 @@ class StreamSession(JsonSession):
 
     async def loop_step(self):
         await Session.loop_step(self)                 # PPPP keepalive only
-        if self._started and time.monotonic() - self.last_video > STALL_SECONDS:
-            log.warning("video stalled %ds — dropping session", STALL_SECONDS)
-            self._on_device_lost()
+
+        # The only liveness check anywhere in the pipeline, so it must not be
+        # gated on self._started. That flag is False until the first keyframe
+        # AND is cleared again by every packet-loss resync, and while it was
+        # part of the condition a session that connected but never produced
+        # playable video was completely undetected: OpenVideo refused, wrong
+        # password, another client already holding the camera (connectNum: 2),
+        # or a resync the camera never completed. We would sit in the P2PAlive
+        # loop forever, and because Session.loop_step (not JsonSession's) runs
+        # here, nothing else was watching either. Nothing above notices a mute
+        # session: ffmpeg blocks reading the FIFO, capture.sh blocks in `wait
+        # -n`, and the supervisor blocks on capture.sh — still holding the wake
+        # lock and the pidfile, so even a plain restart is refused. --give-up
+        # does not cover it either; that only counts discovery timeouts, i.e. an
+        # unreachable IP, and this camera answers discovery fine.
+        #
+        # Time from the last frame handed DOWNSTREAM, not the last packet from
+        # the camera: a camera that talks while emitting nothing decodable is
+        # just as dead to the pipeline. Before anything has ever been emitted we
+        # allow longer, because login + OpenVideo + first keyframe legitimately
+        # takes a few seconds; after that a resync only has to wait one GOP.
+        limit = STALL_SECONDS if self._emitted else ACQUIRE_SECONDS
+        idle = time.monotonic() - self.last_emit
+        if self._dropped or idle <= limit:
+            return
+        self._dropped = True
+        log.warning("no video downstream for %.0fs (last camera packet %.0fs "
+                    "ago, %d frames this session) — dropping session",
+                    idle, time.monotonic() - self.last_video, self.frames)
+        # Say goodbye before going. Our own abandoned sessions otherwise linger
+        # as connections on the camera, and enough of them is itself a reason
+        # the next OpenVideo comes back refused.
+        try:
+            await self.send_close_pkt()
+        except Exception as exc:
+            log.debug("close packet failed on the way out: %s", exc)
+        self._on_device_lost()
 
     async def handle_drw(self, drw):
         await Session.handle_drw(self, drw)           # send DRW ack
@@ -175,6 +213,8 @@ class StreamSession(JsonSession):
                 return
             self._started = True
             log.info("keyframe acquired — streaming")
+        self._emitted = True
+        self.last_emit = time.monotonic()
         self.frames += 1
         self.vbytes += len(hevc)
         if self._on_video:
