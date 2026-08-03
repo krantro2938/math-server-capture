@@ -8,14 +8,25 @@
 # an OOM kill, or a reboot (as long as the Docker daemon is enabled at boot:
 # `sudo systemctl enable docker`).
 #
-# Every service carries `mem_limit` + `mem_swappiness: 0`. The limit stops one
+# Every service carries `mem_limit` + `mem_swappiness: 1`. The limit stops one
 # runaway container taking the host with it; the swappiness is what makes the
 # limit real on this VPS, whose kernel is cgroup v1 without swap accounting
 # (no memory.memsw.limit_in_bytes), so mem_limit alone bounds RAM but lets a
-# container spill into the host swapfile without limit. At 0 the cgroup won't
-# swap: it hits its ceiling and is OOM-killed alone. Sized off observed steady
-# state with an order of magnitude of headroom — they fire on a genuine
-# runaway, never on normal load.
+# container spill into the host's swapfile without limit and still reach a
+# global OOM, just slowly. Near 0 the cgroup won't swap: it hits its ceiling
+# and is OOM-killed alone.
+#
+# It is 1 and not 0 deliberately. Compose serializes this field with omitempty,
+# so a literal 0 is Go's zero value and is dropped before it ever reaches the
+# daemon — `docker compose config` doesn't even echo it back, and the container
+# silently starts at the host default of 60. 1 survives, and swaps only under
+# extreme pressure. Verified with
+#   docker inspect <c> --format '{{.HostConfig.MemorySwappiness}}'
+# and against the cgroup itself at
+#   /sys/fs/cgroup/memory/docker/<id>/memory.swappiness
+#
+# Limits are sized off observed steady state with an order of magnitude of
+# headroom — they fire on a genuine runaway, never on normal load.
 #
 # Credentials live ONLY in .env. MediaMTX reads them via its documented
 # MTX_<PARAM> env overrides, so vps/mediamtx.yml keeps its CHANGE_ME placeholders
@@ -32,7 +43,7 @@ services:
     # Steady state is ~20MB — it muxes to disk rather than buffering in RAM.
     # 256m is an order of magnitude of headroom and still leaves the box room.
     mem_limit: 256m
-    mem_swappiness: 0
+    mem_swappiness: 1
     working_dir: /                     # so the config's ./recordings == /recordings
     volumes:
       - ../mediamtx.yml:/mediamtx.yml:ro
@@ -70,7 +81,7 @@ services:
     # re-negotiation can spike it, so this is deliberately loose — it exists to
     # stop a runaway decode taking the host down, not to police normal use.
     mem_limit: 512m
-    mem_swappiness: 0
+    mem_swappiness: 1
     depends_on: [mediamtx]
     environment:
       MTX_HOST: mediamtx              # service name on the compose network
@@ -110,7 +121,7 @@ services:
     # forks an ffmpeg that decodes 1080p in this same cgroup. 512m is roomy for
     # all three at once and still a quarter of the box.
     mem_limit: 512m
-    mem_swappiness: 0
+    mem_swappiness: 1
     volumes:
       - ../../web:/app:ro          # edit the SPA without rebuilding
     ports:
@@ -150,7 +161,7 @@ services:
     restart: unless-stopped
     # ~24MB steady; the peaks are snapshot buffers on their way to Gemini.
     mem_limit: 384m
-    mem_swappiness: 0
+    mem_swappiness: 1
     profiles: [assignment]
     depends_on: [mediamtx, web]
     ports:
@@ -217,7 +228,7 @@ services:
     # has no growth path — but it fronts every domain, so cap it anyway: if the
     # box is ever under pressure, this is the last thing that should be chosen.
     mem_limit: 128m
-    mem_swappiness: 0
+    mem_swappiness: 1
     profiles: [caddy]
     depends_on: [web]
     ports:
