@@ -20,6 +20,7 @@ Requires: requests, sympy (both pip-installable in Termux).
 
 import argparse
 import base64
+import datetime
 import json
 import os
 import re
@@ -508,24 +509,107 @@ Look at this image of a math problem sheet. Extract ALL the math problems \
 you see, numbered exactly as written. Use LaTeX for math notation. \
 Output ONLY the problems as a markdown list, nothing else."""
 
+# The prompt for every frame after the first.
+#
+# THE CAMERA CANNOT SEE A WHOLE LINE. It shows something like a sixth of the
+# page, so a line of the assignment is routinely split across two frames — the
+# left half in one, the right half in the next. Reading each photograph on its
+# own and concatenating the results therefore cannot work: it produces half
+# lines, the same corner twice, and problem numbers repeated with different
+# fragments under them.
+#
+# So frames are not read independently. Each one is read AGAINST the
+# transcription built so far, and the model returns the whole thing updated —
+# which is what lets it recognise that the text in this frame continues a line
+# it has already seen, rather than starting a new one. This is the same
+# mechanism the online reader uses (`buildPrompt` in
+# lookcam/assignment/server.ts, which passes `state.assignment` into every
+# frame's prompt); the difference is only that this one accumulates markdown
+# rather than a structured JSON assignment, because a 3B model on a phone is
+# not going to fill in a schema with per-line evidence keys.
+VISION_CONTINUE_PROMPT = """\
+You are transcribing ONE assignment sheet that is being photographed a piece \
+at a time. This photograph shows only PART of the sheet, and a line of text \
+may be cut in half by the edge of the frame.
 
-def ocr_image(ollama_url: str, image_b64: str, timeout: int = 120) -> str | None:
-    """Send a base64 image to the VL model, return extracted text."""
+Here is the transcription so far:
+
+{context}
+
+Look at the photograph and return the COMPLETE updated transcription.
+
+RULES
+- Keep every problem already transcribed, even the ones not visible in this \
+photograph. Never drop them.
+- Match problems by their number. If a problem is already listed, do not add \
+it again — improve it in place.
+- If this photograph shows the rest of a line that was cut off, join it up \
+into one line. If it shows the start of a line you already have the end of, \
+put it in front.
+- Add any new problem this photograph shows.
+- Never guess a character you cannot actually read. Leave it out.
+- Use LaTeX for all math: $...$ inline, $$...$$ for display.
+- Output ONLY the transcription as markdown, nothing else — no commentary, no \
+code fences."""
+
+# How much shorter a re-read may be before it is treated as the model having
+# lost the thread rather than tidied up. Same number and the same reasoning as
+# the online reader's `mergeAssignment` ("both finished: take the newer
+# reading... unless most of the text vanished, which is not a refinement").
+MIN_REREAD_RATIO = 0.6
+
+
+def _strip_fences(text: str) -> str:
+    """Drop a ```markdown wrapper if the model added one anyway."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def ocr_image(
+    ollama_url: str,
+    image_b64: str,
+    timeout: int = 120,
+    context: str = "",
+) -> str | None:
+    """Send a base64 image to the VL model, return extracted text.
+
+    With `context`, this is a continuing read: the model gets the transcription
+    so far and returns it updated. See VISION_CONTINUE_PROMPT for why that is
+    the only thing that works with a frame narrower than a line of text.
+    """
     if not VISION_MODEL:
         return None
+    prompt = (
+        VISION_CONTINUE_PROMPT.format(context=context.strip())
+        if context.strip()
+        else VISION_PROMPT
+    )
     payload = {
         "model": VISION_MODEL,
-        "prompt": VISION_PROMPT,
+        "prompt": prompt,
         "images": [image_b64],
         "stream": False,
         "keep_alive": "10s",
-        "options": {"num_predict": 2048, "temperature": 0.1},
+        # A continuing read has to re-emit everything it already knows, so the
+        # ceiling has to grow with the sheet rather than sit at one frame's
+        # worth of text — an answer cut off mid-transcription is indistinguishable
+        # from the model having dropped the rest of the page.
+        "options": {
+            "num_predict": 2048 + 2 * len(context) // 3,
+            "temperature": 0.1,
+        },
     }
     try:
         resp = requests.post(
             f"{ollama_url}/api/generate", json=payload, timeout=timeout)
         resp.raise_for_status()
-        return resp.json().get("response", "").strip()
+        return _strip_fences(resp.json().get("response", ""))
     except Exception as e:
         print(f"[ocr] failed: {e}", file=sys.stderr)
         return None
@@ -542,15 +626,303 @@ import http.server
 import threading
 from urllib.parse import urlparse, parse_qs
 
+# TWO THINGS ARE CALLED A VERSION HERE, and they are not the same thing.
+#
+#   content_version   bumps whenever the transcription TEXT changes. It is what
+#                     `stale` on the AI page compares — "the answer on screen
+#                     was written for a different sheet" — and it stands in for
+#                     the online server's content hash of the markdown.
+#   scan_version      the attempt number. A new one starts when you say this is
+#                     a different sheet (a reset, a restart, a photo published
+#                     with reset=1); adding another photo to the sheet you are
+#                     already reading does not start one. This is what the
+#                     Assignment page's picker is built from.
+#
+# Conflating them gets you either a picker with an entry per photo or a
+# solution that never notices the paper changed.
 _serve_state: dict = {
     "state": "idle",
+    # The live scan: the transcription the solve button will send.
     "markdown": "",
-    "solution": None,
+    "content_version": 1,
+    "scan_version": 1,
+    "scan_created_at": 0,
+    "scan_updated_at": 0,
+    # How many photographs went into the live scan, for the footer's "c3".
+    "captures": 0,
+    # Finished scans, NEWEST FIRST. The live one is not in here.
+    "scans": [],
+    # Which scan the solve button sends, None while it follows the live one.
+    # Set from the Assignment page's "Point the AI here".
+    "active_scan": None,
+    # Every solution this server still holds, NEWEST FIRST. The head is "the"
+    # solution; the rest are what the AI page's version picker is built from.
+    "solutions": [],
+    # Counts from the first solution ever made here, so a version number means
+    # the same thing tomorrow as it does today.
+    "next_solution_id": 1,
+    # The manual batch: photographs taken now, read all at once later. Mirrors
+    # AssignmentStatus["batch"] in evens/test/src/state.ts.
+    "batch": {"active": False, "processing": False, "snapshots": [], "read_state": None},
     "run": None,
     "error": None,
 }
 _serve_llama_url = ""
 _serve_lock = threading.Lock()
+
+# How many solutions to keep. Each is a few KB of markdown, so this is about
+# keeping the state file honest rather than about disk.
+MAX_SOLUTIONS = 20
+# Same, for scans.
+MAX_SCANS = 20
+# How many photographs one batch may hold. Each is OCR'd separately by the
+# vision model at the end, and that is ~10-20s apiece on the phone.
+MAX_BATCH_SNAPSHOTS = 40
+
+# ── keeping it across a restart ─────────────────────────────────────────────
+#
+# This used to be memory and nothing else, which made the offline mode quietly
+# useless: solver.py restarting — a crash, `start.sh` cycling it, Android
+# reaping Termux in your pocket — took the assignment and every solution with
+# it, and the glasses came back to "NOTHING TO SOLVE" with no way to tell that
+# from never having scanned anything. There is no other copy. The phone-side
+# tile cache (evens/test/src/render/tileCache.ts) holds *pictures* of a
+# document for redrawing; it is never read back as an assignment, and nothing
+# uploads it here.
+#
+# So the state that took work to produce — the transcription, and the answers —
+# is written to disk on every change and read back at startup. `run` is
+# deliberately not persisted: a solve cannot survive the process that was doing
+# it, and restoring one would leave the page waiting forever on a thread that
+# does not exist.
+
+STATE_FILE = ""
+
+
+_RENDER_CACHE_KEYS = ("tiles", "tiles_version", "scan_tiles", "scan_tiles_version")
+
+
+def _persistable(items: list) -> list:
+    """Documents without their render cache — several hundred KB of base64 PNG
+    apiece, rebuildable in under a second. See _build_tiles."""
+    return [
+        {k: v for k, v in item.items() if k not in _RENDER_CACHE_KEYS}
+        for item in items
+    ]
+
+
+def _state_snapshot() -> dict:
+    """The parts of `_serve_state` worth keeping. Caller holds the lock.
+
+    The batch is not among them: it is a handful of JPEGs held in memory
+    mid-gesture, and a batch you were halfway through photographing does not
+    survive the process any more than a solve does.
+    """
+    return {
+        "markdown": _serve_state["markdown"],
+        "content_version": _serve_state["content_version"],
+        "scan_version": _serve_state["scan_version"],
+        "scan_created_at": _serve_state["scan_created_at"],
+        "scan_updated_at": _serve_state["scan_updated_at"],
+        "captures": _serve_state["captures"],
+        "active_scan": _serve_state["active_scan"],
+        "scans": _persistable(_serve_state["scans"]),
+        "next_solution_id": _serve_state["next_solution_id"],
+        "solutions": _persistable(_serve_state["solutions"]),
+    }
+
+
+def _save_state():
+    """Write the state file. Caller holds `_serve_lock`.
+
+    Via a temporary file and os.replace, so a process killed mid-write leaves
+    the previous state intact rather than a truncated file that fails to parse
+    on the next boot — which would lose exactly what this is here to protect.
+    """
+    if not STATE_FILE:
+        return
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_state_snapshot(), f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        # Never fatal. A server that can't write its state is still a server.
+        print(f"[serve] could not save state: {e}", file=sys.stderr)
+
+
+def _load_state():
+    """Read the state file back at startup, if there is one."""
+    if not STATE_FILE or not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE) as f:
+            saved = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[serve] ignoring unreadable state file: {e}", file=sys.stderr)
+        return
+
+    _serve_state["markdown"] = saved.get("markdown", "") or ""
+    _serve_state["content_version"] = saved.get("content_version", 1)
+    _serve_state["scan_version"] = saved.get("scan_version", 1)
+    _serve_state["scan_created_at"] = saved.get("scan_created_at", 0)
+    _serve_state["scan_updated_at"] = saved.get("scan_updated_at", 0)
+    _serve_state["captures"] = saved.get("captures", 0)
+    _serve_state["active_scan"] = saved.get("active_scan")
+    _serve_state["scans"] = [
+        s for s in saved.get("scans", []) if s.get("markdown")
+    ][:MAX_SCANS]
+    _serve_state["solutions"] = [
+        s for s in saved.get("solutions", []) if s.get("markdown")
+    ][:MAX_SOLUTIONS]
+    # Ahead of whatever was saved, so a state file written by an older build
+    # (or hand-edited) can't hand out an id that is already taken.
+    highest = max((s.get("id", 0) for s in _serve_state["solutions"]), default=0)
+    _serve_state["next_solution_id"] = max(saved.get("next_solution_id", 1), highest + 1)
+    # Same for the scan number, which the archive also has a claim on.
+    top_scan = max((s.get("version", 0) for s in _serve_state["scans"]), default=0)
+    _serve_state["scan_version"] = max(_serve_state["scan_version"], top_scan + 1)
+    # Whatever it was doing when it died, it isn't doing it now.
+    _serve_state["state"] = "solved" if _serve_state["solutions"] else "idle"
+    _serve_state["run"] = None
+    _serve_state["batch"] = {
+        "active": False, "processing": False, "snapshots": [], "read_state": None,
+    }
+
+    print(
+        f"[serve] restored {len(_serve_state['solutions'])} solution(s), "
+        f"{len(_serve_state['scans'])} archived scan(s), live scan v"
+        f"{_serve_state['scan_version']}: "
+        f"{len(parse_problems(_serve_state['markdown']))} problems",
+        file=sys.stderr,
+    )
+
+
+def _pick_solution(solution_id: int | None) -> dict | None:
+    """The solution the client asked for, or the newest. Caller holds the lock.
+
+    An id that no longer exists falls back to the newest rather than to
+    nothing: the alternative is a blank page on the glasses for a version that
+    has aged out, which reads as a broken reader.
+    """
+    saved = _serve_state["solutions"]
+    if not saved:
+        return None
+    if solution_id is not None:
+        for s in saved:
+            if s["id"] == solution_id:
+                return s
+    return saved[0]
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _set_assignment(markdown: str, captures: int = 0):
+    """Put a transcription in front of the solver. Caller holds the lock.
+
+    `content_version` bumps only when the text actually changes, so re-posting
+    the same sheet doesn't age every solution that answers it. A different
+    sheet does age them, which is the point: it is what makes `stale` mean
+    something and brings the solve button back over an answer to the previous
+    page.
+    """
+    if captures:
+        _serve_state["captures"] += captures
+        _serve_state["scan_updated_at"] = _now_ms()
+    if not _serve_state["scan_created_at"]:
+        _serve_state["scan_created_at"] = _now_ms()
+    if markdown == _serve_state["markdown"]:
+        return
+    _serve_state["markdown"] = markdown
+    _serve_state["content_version"] += 1
+    _serve_state["scan_updated_at"] = _now_ms()
+    # A changed assignment asks a different question than whatever was last
+    # solved — bring the button back rather than leaving it on "solved".
+    if _serve_state["state"] != "solving":
+        _serve_state["state"] = "idle"
+
+
+def _new_scan():
+    """Archive the live scan and start an empty one. Caller holds the lock.
+
+    What "this is a different sheet" means: a reset, a restart, or a photo
+    published with reset=1. The old transcription is kept rather than
+    overwritten — it is minutes of the phone's vision model, the solutions on
+    file were written FOR it, and the Assignment page has a picker that exists
+    to go back and read it.
+    """
+    live = _serve_state["markdown"]
+    if live:
+        _serve_state["scans"].insert(0, {
+            "version": _serve_state["scan_version"],
+            "markdown": live,
+            "created_at": _serve_state["scan_created_at"] or _now_ms(),
+            "updated_at": _serve_state["scan_updated_at"] or _now_ms(),
+            "captures": _serve_state["captures"],
+            "content_version": _serve_state["content_version"],
+        })
+        del _serve_state["scans"][MAX_SCANS:]
+        _serve_state["scan_version"] += 1
+
+    _serve_state["markdown"] = ""
+    _serve_state["captures"] = 0
+    _serve_state["scan_created_at"] = _now_ms()
+    _serve_state["scan_updated_at"] = _now_ms()
+    # The new sheet is unread, so there is nothing to solve on it yet — and
+    # anything that was is now answering the scan we just archived.
+    _serve_state["content_version"] += 1
+    if _serve_state["state"] != "solving":
+        _serve_state["state"] = "idle"
+    # Following the live scan again: the picker's pin pointed at a scan that is
+    # no longer the one in front of you.
+    _serve_state["active_scan"] = None
+
+
+def _live_scan() -> dict:
+    """The live scan in the same shape as an archived one."""
+    return {
+        "version": _serve_state["scan_version"],
+        "markdown": _serve_state["markdown"],
+        "created_at": _serve_state["scan_created_at"] or _now_ms(),
+        "updated_at": _serve_state["scan_updated_at"] or _now_ms(),
+        "captures": _serve_state["captures"],
+        "content_version": _serve_state["content_version"],
+    }
+
+
+def _pick_scan(version: int | None) -> dict:
+    """The scan the client asked for, or the live one. Caller holds the lock.
+
+    Like `_pick_solution`, an unknown version falls back to the live scan
+    rather than to nothing: a blank page reads as a broken reader.
+    """
+    if version is not None and version != _serve_state["scan_version"]:
+        for s in _serve_state["scans"]:
+            if s["version"] == version:
+                return s
+    return _live_scan()
+
+
+def _solve_source() -> dict:
+    """The scan the solve button sends: the pinned one, or the live one."""
+    return _pick_scan(_serve_state["active_scan"])
+
+
+def _query_int(path: str, key: str) -> int | None:
+    """?key=N from a request path, if it is there and is a number."""
+    raw = parse_qs(urlparse(path).query).get(key, [""])[0]
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _query_solution_id(path: str) -> int | None:
+    """?solution_id=N from a request path, if it is there and is a number."""
+    return _query_int(path, "solution_id")
 
 
 def _pick_camera_snapshot() -> tuple[bytes | None, str, float]:
@@ -591,15 +963,13 @@ def _pick_camera_snapshot() -> tuple[bytes | None, str, float]:
 
 
 def _build_camera_status() -> dict:
-    """A minimal AssignmentStatus (see evens/test/src/state.ts) reflecting
-    camera-feed health only.
+    """An AssignmentStatus (see evens/test/src/state.ts). Caller holds the lock.
 
-    Offline mode has no scan-tracking pipeline — no per-frame OCR, no framing
-    advice, no edge-coverage gate. Getting problems into the assignment is
-    POST /assignment/photo (one-shot). This exists so the Camera page's menu
-    and corner box read something honest ("nothing read yet") instead of
-    "Connecting..." forever; the "start/stop reading" menu entries it offers
-    have nothing behind them offline and will answer "couldn't start: refused".
+    Offline mode has no CONTINUOUS reader — no per-frame OCR as you look, no
+    framing advice, no edge-coverage gate, so `running` is always false and
+    `feedback` is always null. What it does have is the manual batch: photograph
+    the sheet a few times, then read the lot at once (see _handle_control), and
+    one-shot publishing via POST /assignment/photo.
     """
     _, which, age_ms = _pick_camera_snapshot()
     if not which:
@@ -610,11 +980,31 @@ def _build_camera_status() -> dict:
         upstream = "error"
 
     markdown = _serve_state["markdown"]
+    batch = _serve_state["batch"]
+    # Newest first, live scan at the head — the Assignment page's picker.
+    versions = [
+        {
+            "version": s["version"],
+            # ISO strings: the online reader stores timestamps and the page
+            # only ever hands these to `new Date(...)`.
+            "created_at": _iso(s["created_at"]),
+            "updated_at": _iso(s["updated_at"]),
+            "capture_count": s.get("captures", 0),
+            "done": bool(s["markdown"]),
+            "problems": len(parse_problems(s["markdown"])) if s["markdown"] else 0,
+            "title": f"Scan v{s['version']}",
+            "archived": archived,
+        }
+        for s, archived in (
+            [(_live_scan(), False)] + [(s, True) for s in _serve_state["scans"]]
+        )
+    ]
+
     return {
         "upstream": upstream,
         "running": False,
         "done": bool(markdown),
-        "captures": 0,
+        "captures": _serve_state["captures"],
         "max_captures": 0,
         "reason": None,
         "problems": len(parse_problems(markdown)) if markdown else 0,
@@ -625,12 +1015,30 @@ def _build_camera_status() -> dict:
         "next_target_short": "",
         "feedback": None,
         "error": None if which else "no camera configured",
-        "version": 1,
-        "active_version": None,
-        "versions": [],
-        "last_capture_at": None,
-        "batch": {"active": False, "processing": False, "snapshot_count": 0, "max_snapshots": 40},
+        "version": _serve_state["scan_version"],
+        "active_version": _serve_state["active_scan"],
+        "versions": versions,
+        "last_capture_at": _serve_state["scan_updated_at"] or None,
+        "batch": {
+            "active": batch["active"],
+            "processing": batch["processing"],
+            "snapshot_count": len(batch["snapshots"]),
+            "max_snapshots": MAX_BATCH_SNAPSHOTS,
+            # Who is reading it. Offline that is never a routine or Gemini —
+            # it is the vision model on this phone, and saying so is the
+            # difference between a wait you understand and one you don't.
+            "reader": f"local/{VISION_MODEL}" if batch["processing"] else None,
+            "read_state": batch["read_state"],
+        },
     }
+
+
+def _iso(ms: int) -> str:
+    """Milliseconds since the epoch as an ISO string, which is what the
+    Assignment page's `versions` entries carry online."""
+    if not ms:
+        return ""
+    return datetime.datetime.fromtimestamp(ms / 1000).isoformat()
 
 
 def _ollama_status() -> dict:
@@ -690,41 +1098,46 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/tiles":
             with _serve_lock:
-                return self._json(200, _build_tiles())
+                return self._json(200, _build_tiles(_query_solution_id(self.path)))
 
         if path == "/markdown":
+            # JSON {content, version}, matching the VPS (evens/server/index.ts's
+            # GET /markdown) — NOT the text/markdown body this used to return.
+            # The client's fetchSnapshot parses this as JSON, so a plain-text
+            # answer threw on every call: the poll fallback and the text-mode
+            # fallback were both broken offline, which is how a page with no
+            # tiles ended up with nothing left to try.
             with _serve_lock:
-                md = _serve_state["solution"]["markdown"] if _serve_state["solution"] else ""
-            self.send_response(200)
-            self.send_header("Content-Type", "text/markdown")
-            self._cors()
-            self.end_headers()
-            self.wfile.write(md.encode())
-            return
+                sol = _pick_solution(_query_solution_id(self.path))
+                return self._json(200, {
+                    "content": sol["markdown"] if sol else "",
+                    "version": sol["created_at"] if sol else 0,
+                })
 
         if path.startswith("/events"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self._cors()
-            self.end_headers()
-            with _serve_lock:
-                data = json.dumps(_build_status())
-            self.wfile.write(f"event: status\ndata: {data}\n\n".encode())
-            self.wfile.flush()
-            try:
-                while True:
-                    time.sleep(5)
-                    with _serve_lock:
-                        data = json.dumps(_build_status())
-                    self.wfile.write(f"event: status\ndata: {data}\n\n".encode())
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                return
+            return self._handle_events(_query_solution_id(self.path))
 
         if path == "/assignment/status":
             with _serve_lock:
                 return self._json(200, _build_camera_status())
+
+        # The Assignment page reading the local store. Both were missing, so
+        # that page had nothing to show offline at all: it is an ordinary
+        # document page (docPage.ts) and these are the two endpoints it reads.
+        if path == "/assignment/markdown":
+            with _serve_lock:
+                scan = _pick_scan(_query_int(self.path, "version"))
+                return self._json(200, {
+                    "content": scan["markdown"],
+                    "version": scan["content_version"],
+                })
+
+        if path == "/assignment/tiles":
+            with _serve_lock:
+                return self._json(200, _build_scan_tiles(
+                    _query_int(self.path, "version"),
+                    parse_qs(urlparse(self.path).query).get("overlay", [""])[0],
+                ))
 
         if path == "/assignment/camera":
             return self._handle_camera_preview()
@@ -735,17 +1148,61 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self._cors()
             self.end_headers()
+            sent_version = None
             try:
                 while True:
                     with _serve_lock:
                         data = json.dumps(_build_camera_status())
+                        scan = _pick_scan(_query_int(self.path, "version"))
+                        version = scan["content_version"]
                     self.wfile.write(f"event: status\ndata: {data}\n\n".encode())
+                    # Same reason as the solution stream: without this the page
+                    # never learns a batch has landed, because the poll that
+                    # would notice only runs while this stream is down.
+                    if version != sent_version:
+                        sent_version = version
+                        payload = json.dumps({"version": version})
+                        self.wfile.write(f"event: markdown\ndata: {payload}\n\n".encode())
                     self.wfile.flush()
                     time.sleep(5)
             except (BrokenPipeError, ConnectionResetError):
                 return
 
         self._json(404, {"ok": False, "detail": "not found"})
+
+    def _handle_events(self, solution_id: int | None):
+        """The AI page's live stream: status, and when the document changed.
+
+        The `markdown` event is the half that was missing. The client only
+        refetches tiles when it is told the document changed (docPage.ts's SSE
+        listener); the poll that would otherwise catch up runs ONLY while the
+        stream is down, and this stream is up. So a solve finishing offline
+        moved the status to `solved` — taking the button away — and left the
+        old tiles, or none at all, on the glasses until you walked off the page
+        and back on.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self._cors()
+        self.end_headers()
+
+        sent_version = None
+        try:
+            while True:
+                with _serve_lock:
+                    status = json.dumps(_build_status())
+                    sol = _pick_solution(solution_id)
+                    version = sol["created_at"] if sol else 0
+                self.wfile.write(f"event: status\ndata: {status}\n\n".encode())
+                if version != sent_version:
+                    sent_version = version
+                    payload = json.dumps({"version": version})
+                    self.wfile.write(f"event: markdown\ndata: {payload}\n\n".encode())
+                self.wfile.flush()
+                time.sleep(5)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _handle_camera_preview(self):
         """GET /assignment/camera — one frame from whichever camera is
@@ -803,10 +1260,142 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/assignment/markdown":
             with _serve_lock:
-                _serve_state["markdown"] = body.get("markdown", "")
+                _set_assignment(body.get("markdown", ""))
+                _save_state()
             return self._json(200, {"ok": True})
 
+        if path == "/assignment/control":
+            return self._handle_control(body.get("action", ""))
+
+        if path == "/assignment/active":
+            # Which scan the solve button sends. The Assignment page's "Point
+            # the AI here"; the answer is the selection actually settled on,
+            # which the status stream then carries to the AI page.
+            with _serve_lock:
+                wanted = body.get("version")
+                known = {s["version"] for s in _serve_state["scans"]}
+                known.add(_serve_state["scan_version"])
+                if wanted is not None and wanted not in known:
+                    return self._json(404, {"ok": False, "detail": f"no scan v{wanted}"})
+                # Pinning the live scan IS following it: keep it null so a new
+                # batch doesn't leave the button aimed at yesterday's sheet.
+                if wanted == _serve_state["scan_version"]:
+                    wanted = None
+                _serve_state["active_scan"] = wanted
+                _save_state()
+            return self._json(200, {"ok": True, "version": wanted})
+
         self._json(404, {"ok": False, "detail": "not found"})
+
+    def _handle_control(self, action: str):
+        """POST /assignment/control — the Camera page's menu.
+
+        Offline there is no continuous reader to start, stop or extend: nothing
+        is watching the camera and grading frames as you aim. What there is is
+        the MANUAL BATCH, which is the same gesture from the wearer's side —
+        photograph the sheet a few times, then send the lot — and the only one
+        of these actions that has anything behind it here.
+
+        The rest are refused by name rather than with a generic "not found".
+        The menu offers them because it is drawn from the same status shape as
+        online, and "couldn't start reading: no continuous reader offline" is a
+        sentence you can act on; "refused" is not.
+        """
+        batch = _serve_state["batch"]
+
+        if action == "batch_start":
+            with _serve_lock:
+                if batch["processing"]:
+                    return self._json(409, {
+                        "ok": False, "action": "failed",
+                        "detail": "still reading the last batch",
+                    })
+                batch["active"] = True
+                batch["snapshots"] = []
+                batch["read_state"] = None
+            return self._json(200, {"ok": True, "action": "batch_started"})
+
+        if action == "batch_snapshot":
+            if not batch["active"]:
+                return self._json(409, {
+                    "ok": False, "action": "failed", "detail": "no batch started",
+                })
+            # Outside the lock: reading the JPEG off disk is I/O, and the
+            # status stream should not stall behind it.
+            jpeg, which, age_ms = _pick_camera_snapshot()
+            if jpeg is None:
+                return self._json(503, {
+                    "ok": False, "action": "failed", "detail": "no camera configured",
+                })
+            if age_ms > CAMERA_STALL_MS:
+                return self._json(503, {
+                    "ok": False, "action": "failed",
+                    "detail": f"{which} camera stalled ({round(age_ms / 1000)}s)",
+                })
+            with _serve_lock:
+                if len(batch["snapshots"]) >= MAX_BATCH_SNAPSHOTS:
+                    return self._json(409, {
+                        "ok": False, "action": "failed",
+                        "detail": f"batch full at {MAX_BATCH_SNAPSHOTS}",
+                    })
+                batch["snapshots"].append(jpeg)
+                count = len(batch["snapshots"])
+            return self._json(200, {
+                "ok": True, "action": "batch_snapshot", "detail": f"{count} held",
+            })
+
+        if action == "batch_finish":
+            if not VISION_MODEL:
+                return self._json(500, {
+                    "ok": False, "action": "failed",
+                    "detail": "no vision model configured",
+                })
+            with _serve_lock:
+                if not batch["snapshots"]:
+                    return self._json(409, {
+                        "ok": False, "action": "failed", "detail": "no snapshots",
+                    })
+                if batch["processing"]:
+                    return self._json(409, {
+                        "ok": False, "action": "failed", "detail": "already reading",
+                    })
+                batch["active"] = False
+                batch["processing"] = True
+                batch["read_state"] = "claimed"
+                count = len(batch["snapshots"])
+            threading.Thread(target=_batch_read_thread, daemon=True).start()
+            return self._json(200, {
+                "ok": True, "action": "batch_finished", "detail": f"reading {count}",
+            })
+
+        if action == "batch_cancel":
+            with _serve_lock:
+                batch["active"] = False
+                batch["snapshots"] = []
+                batch["read_state"] = None
+            return self._json(200, {"ok": True, "action": "batch_cancelled"})
+
+        if action in ("reset", "restart"):
+            with _serve_lock:
+                _new_scan()
+                _save_state()
+            return self._json(200, {"ok": True, "action": action})
+
+        if action == "complete":
+            # `done` offline is just "is there anything transcribed", so this
+            # is already true if it can be. Answering ok keeps the menu entry
+            # from reading as broken.
+            return self._json(200, {"ok": True, "action": "complete"})
+
+        if action in ("start", "stop", "extend"):
+            return self._json(200, {
+                "ok": False, "action": "failed",
+                "detail": "no continuous reader offline - use Batch snapshots",
+            })
+
+        return self._json(400, {
+            "ok": False, "action": "failed", "detail": f'unknown action "{action}"',
+        })
 
     def _handle_photo(self, raw: bytes):
         """Publish a photo of the assignment sheet.
@@ -824,24 +1413,38 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
         query = parse_qs(urlparse(self.path).query)
         reset = query.get("reset", ["0"])[0] == "1"
 
+        # A different sheet starts a new scan BEFORE the read, so the read is
+        # not handed the previous sheet as context to continue.
+        if reset:
+            with _serve_lock:
+                _new_scan()
+                _save_state()
+
+        with _serve_lock:
+            transcript = _serve_state["markdown"]
+
         image_b64 = base64.b64encode(raw).decode()
-        text = ocr_image(_serve_llama_url, image_b64)
+        # Continues the transcription rather than being appended to it, for the
+        # reason in VISION_CONTINUE_PROMPT: this camera cannot fit a line of
+        # the sheet in one frame, so a second photograph is usually the other
+        # half of something already half-read, not a separate piece of text.
+        text = ocr_image(_serve_llama_url, image_b64, context=transcript)
         if not text:
             return self._json(500, {"ok": False, "detail": "OCR failed"})
 
         with _serve_lock:
-            # Merge onto the existing transcription the way a camera frame
-            # would, unless the caller said this is a different sheet.
-            if reset or not _serve_state["markdown"]:
-                _serve_state["markdown"] = text
-            else:
-                _serve_state["markdown"] = _serve_state["markdown"].rstrip() + "\n\n" + text
-            # A changed assignment answers a different question than whatever
-            # was last solved — bring the button back rather than leaving it
-            # on a stale "solved".
-            if _serve_state["state"] != "solving":
-                _serve_state["state"] = "idle"
+            if transcript and len(text) < len(transcript) * MIN_REREAD_RATIO:
+                # See _batch_read_thread: a re-read that came back far shorter
+                # lost the thread, and taking it would discard what earlier
+                # photographs got right.
+                problems = len(parse_problems(_serve_state["markdown"]))
+                return self._json(200, {
+                    "ok": True, "problems": problems, "done": True,
+                    "detail": "kept the longer transcription",
+                })
+            _set_assignment(text, captures=1)
             problems = len(parse_problems(_serve_state["markdown"]))
+            _save_state()
 
         return self._json(200, {"ok": True, "problems": problems, "done": True})
 
@@ -860,19 +1463,23 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
             if _serve_state["state"] == "solving":
                 return self._json(409, {"ok": False, "detail": "already solving"})
             if body.get("markdown"):
-                _serve_state["markdown"] = body["markdown"]
-            if not _serve_state["markdown"]:
+                _set_assignment(body["markdown"])
+            if not _solve_source()["markdown"]:
                 return self._json(400, {"ok": False, "detail": "no assignment"})
             _serve_state["state"] = "solving"
             _serve_state["error"] = None
+            _save_state()
 
         self._json(200, {"ok": True, "action": "queued"})
         threading.Thread(target=_solve_thread, daemon=True).start()
 
     def _handle_cancel(self):
         with _serve_lock:
-            _serve_state["state"] = "idle"
+            # Back to whatever there is to read, not to a blank page: an
+            # earlier answer is still on file and the reader should have it.
+            _serve_state["state"] = "solved" if _serve_state["solutions"] else "idle"
             _serve_state["run"] = None
+            _save_state()
         self._json(200, {"ok": True, "action": "cancelled"})
 
     def log_message(self, fmt, *args):
@@ -881,15 +1488,22 @@ class _LocalHandler(http.server.BaseHTTPRequestHandler):
 
 def _build_status() -> dict:
     s = _serve_state
+    newest = s["solutions"][0] if s["solutions"] else None
     solution = None
-    if s["solution"]:
+    # What the solve button would send: the pinned scan, or the live one.
+    source = _solve_source()
+    if newest:
         solution = {
-            "created_at": s["solution"]["created_at"],
-            "age_ms": int((time.time() - s["solution"]["created_at"] / 1000) * 1000),
+            "created_at": newest["created_at"],
+            "age_ms": max(0, _now_ms() - newest["created_at"]),
             "model": MODEL_NAME,
-            "assignment_version": 1,
-            "stale": False,
-            "chars": len(s["solution"].get("markdown", "")),
+            "assignment_version": newest.get("content_version", 1),
+            # It answers an earlier sheet than the one the button is aimed at.
+            # Now that solutions outlive the process this is a real state
+            # offline and not the constant False it used to be — it is what
+            # puts "(shown: earlier scan)" under the solve button.
+            "stale": newest.get("content_version", 1) != source["content_version"],
+            "chars": len(newest.get("markdown", "")),
         }
     # The client's button only invites a tap for `idle`/`failed`; without this
     # a fresh server with nothing transcribed yet still reports "idle" and the
@@ -897,36 +1511,56 @@ def _build_status() -> dict:
     # then 400s "no assignment" the moment you tap it. See server/solver.ts's
     # getSolverStatus for the online equivalent of this gate.
     state = s["state"]
-    if state == "idle" and not s["markdown"]:
+    if state == "idle" and not source["markdown"]:
         state = "no_assignment"
 
     return {
         "state": state,
         "assignment": {
-            "available": bool(s["markdown"]),
-            "version": 1 if s["markdown"] else None,
-            "problems": len(parse_problems(s["markdown"])) if s["markdown"] else 0,
-            "done": bool(s["markdown"]),
+            "available": bool(source["markdown"]),
+            "version": source["content_version"] if source["markdown"] else None,
+            "problems": len(parse_problems(source["markdown"])) if source["markdown"] else 0,
+            "done": bool(source["markdown"]),
+            # Which scan the button would send, so the AI page's footer can say
+            # "Tap to solve scan v2" rather than implying it is the live one.
+            "active_version": s["active_scan"],
         },
         "solution": solution,
         "run": s["run"],
         "trigger": {"configured": True, "detail": "local solver"},
         "mode": "offline",
-        "solutions": 1 if s["solution"] else 0,
-        "solution_history": [],
+        "solutions": len(s["solutions"]),
+        # The version picker's list (see ai.ts buildVersionMenu). This was a
+        # hardcoded empty array, which meant the whole of the AI page's history
+        # UI — "Open a version...", "Back to latest", "Get quick solution" —
+        # was dead offline no matter how many solves you had run.
+        "solution_history": [
+            {
+                "id": item["id"],
+                "version": item["version"],
+                "created_at": item["created_at"],
+                "model": MODEL_NAME,
+                "assignment_version": item.get("content_version", 1),
+                "chars": len(item.get("markdown", "")),
+            }
+            for item in s["solutions"]
+        ],
     }
 
 
-def _build_tiles() -> dict:
-    """Render the current solution to tile PNGs (see render.py).
+def _build_tiles(solution_id: int | None = None) -> dict:
+    """Render a solution to tile PNGs (see render.py).
 
     Cached on the solution dict and keyed by its created_at timestamp, so
     repeated polling (the client hits /tiles on every status change) doesn't
     re-render. If render.py's deps aren't installed, falls back to empty
-    pages — the client then renders client-side in the WebView instead (see
-    evens/test/src/render/tiles.ts), which is what this replaces.
+    pages — the client then falls back to text mode (see docPage.ts's
+    showTextFallback).
+
+    `solution_id` is the version picker's pin: the page asks for one solution
+    by name and must get that one, not whatever is newest.
     """
-    sol = _serve_state["solution"]
+    sol = _pick_solution(solution_id)
     if not sol or not sol.get("markdown") or render is None or not render.RENDER_AVAILABLE:
         return {"version": 0, "pages": []}
 
@@ -942,11 +1576,121 @@ def _build_tiles() -> dict:
     return {"version": version, "pages": sol.get("tiles", [])}
 
 
+def _build_scan_tiles(version: int | None, overlay: str) -> dict:
+    """The same, for a transcription rather than a solution.
+
+    `overlay=menu` is the variant render with the action menu's rectangle
+    reserved, so the Assignment page can open a menu without taking the
+    transcription off the screen. render.py cannot reserve a rect, so the
+    honest answer is to render the plain document and NOT claim an overlay:
+    the client checks that field, and a server that quietly ignores the query
+    leaves the menu unreadable over text it failed to cover (see docPage.ts's
+    loadVariant). Saying nothing puts it on the plain backdrop instead, which
+    is uglier and legible.
+    """
+    scan = _pick_scan(version)
+    if not scan["markdown"] or render is None or not render.RENDER_AVAILABLE:
+        return {"version": 0, "pages": [], "overlay": None}
+
+    # The live scan's dict is rebuilt on every call, so its render cache has to
+    # live somewhere that persists — hence keying off the state itself.
+    cache = _serve_state if scan["version"] == _serve_state["scan_version"] else scan
+    key = scan["content_version"]
+    if cache.get("scan_tiles_version") != key:
+        try:
+            cache["scan_tiles"] = render.render_markdown_to_tiles(scan["markdown"])
+        except Exception as e:
+            print(f"[serve] assignment tile render failed: {e}", file=sys.stderr)
+            cache["scan_tiles"] = []
+        cache["scan_tiles_version"] = key
+
+    return {"version": key, "pages": cache.get("scan_tiles", []), "overlay": None}
+
+
+def _batch_read_thread():
+    """Read every photograph in the batch into ONE transcription.
+
+    The offline half of "Send batch to AI". Online the images go to a Claude
+    routine and fall back to a chain of hosted models (see
+    lookcam/assignment/server.ts); here it is the phone's own vision model, and
+    the images are read STRICTLY IN ORDER, each one against everything read so
+    far — see VISION_CONTINUE_PROMPT. A frame from this camera holds about a
+    sixth of the page and routinely cuts a line in half, so the only thing that
+    can join those halves is a reader that can see both at once.
+
+    Hence a thread, and hence the Camera page being told `processing` for the
+    whole of it: the reads are sequential by necessity, not by choice, and a
+    batch of six is minutes.
+    """
+    with _serve_lock:
+        images = list(_serve_state["batch"]["snapshots"])
+        # Photographs of a sheet already partly transcribed continue THAT
+        # transcription — publishing three more frames of the sheet you are
+        # halfway through is the normal way to finish it.
+        transcript = _serve_state["markdown"]
+
+    read = 0
+    failures = 0
+    for index, jpeg in enumerate(images, 1):
+        try:
+            text = ocr_image(
+                _serve_llama_url,
+                base64.b64encode(jpeg).decode(),
+                context=transcript,
+            )
+        except Exception as e:
+            print(f"[serve] batch image {index} failed: {e}", file=sys.stderr)
+            text = ""
+
+        if not text:
+            failures += 1
+            print(f"[serve] batch {index}/{len(images)}: nothing read", file=sys.stderr)
+            continue
+
+        # The model was asked to return everything it already knew plus what
+        # this frame adds. A much SHORTER answer means it lost the thread —
+        # a 3B model re-emitting a growing document does sometimes stop early
+        # or start over — and accepting it would throw away frames that were
+        # read correctly. Keep what we had; this frame simply contributed
+        # nothing. Losing one frame beats losing the sheet.
+        if transcript and len(text) < len(transcript) * MIN_REREAD_RATIO:
+            failures += 1
+            print(f"[serve] batch {index}/{len(images)}: re-read came back "
+                  f"{len(text)} chars against {len(transcript)} - keeping the "
+                  f"longer transcription", file=sys.stderr)
+            continue
+
+        transcript = text
+        read += 1
+        print(f"[serve] batch {index}/{len(images)}: {len(text)} chars", file=sys.stderr)
+
+    with _serve_lock:
+        batch = _serve_state["batch"]
+        if read:
+            _set_assignment(transcript, captures=read)
+        batch["processing"] = False
+        batch["snapshots"] = []
+        # Kept rather than cleared: the Camera page shows the read state, and
+        # "every image failed" is the one outcome worth still being on screen
+        # after the spinner stops.
+        batch["read_state"] = "submitted" if read else "failed"
+        problems = len(parse_problems(_serve_state["markdown"]))
+        _save_state()
+
+    print(f"[serve] batch read: {read} of {len(images)} images used, "
+          f"{failures} dropped, assignment now {problems} problems", file=sys.stderr)
+
+
 def _solve_thread():
     """Run the solver in a background thread, updating shared state."""
     global _serve_state
     with _serve_lock:
-        markdown = _serve_state["markdown"]
+        # Whatever the button was aimed at when it was pressed, held for the
+        # length of the solve: a photo landing mid-run must not change which
+        # sheet the answer is about.
+        source = _solve_source()
+        markdown = source["markdown"]
+        answering = source["content_version"]
         _serve_state["run"] = {
             "id": 1, "state": "solving",
             "created_at": int(time.time() * 1000),
@@ -972,14 +1716,24 @@ def _solve_thread():
     solution_md = "\n\n".join(sections).strip()
 
     with _serve_lock:
+        solution_id = _serve_state["next_solution_id"]
+        _serve_state["next_solution_id"] = solution_id + 1
         _serve_state["state"] = "solved"
-        _serve_state["solution"] = {
+        # Onto the front of the list rather than over the top of the last one:
+        # a re-solve of the same sheet is a second opinion, and the page has a
+        # picker for exactly that.
+        _serve_state["solutions"].insert(0, {
+            "id": solution_id,
+            "version": solution_id,
             "markdown": solution_md,
-            "created_at": int(time.time() * 1000),
-        }
+            "created_at": _now_ms(),
+            "content_version": answering,
+        })
+        del _serve_state["solutions"][MAX_SOLUTIONS:]
         _serve_state["run"] = None
+        _save_state()
 
-    print(f"[serve] solved: {len(solution_md)} chars", file=sys.stderr)
+    print(f"[serve] solved: {len(solution_md)} chars (v{solution_id})", file=sys.stderr)
 
 
 def serve(host: str, port: int, llama_url: str):
@@ -987,7 +1741,28 @@ def serve(host: str, port: int, llama_url: str):
     global _serve_llama_url
     _serve_llama_url = llama_url
 
-    server = http.server.HTTPServer((host, port), _LocalHandler)
+    _load_state()
+    print(f"[serve] state file: {STATE_FILE or '(none - nothing will survive a restart)'}",
+          file=sys.stderr)
+
+    # THREADING IS NOT OPTIONAL HERE, and this was a plain HTTPServer.
+    #
+    # `/events` and `/assignment/events` are SSE streams: their handlers loop
+    # forever by design. On a single-threaded server the first one to connect
+    # takes the only thread and never gives it back, so from the moment the
+    # glasses subscribe — which docPage.ts does immediately after asking for
+    # the document — this server answers NOTHING else. No /tiles, no /markdown,
+    # no /solution/status, not even after the stream is closed, because the
+    # handler is asleep between beats and the backlog never drains.
+    #
+    # That is the whole of "the AI page just sits on Loading..." in offline
+    # mode: the page was not slow and the model was not thinking, the server
+    # had stopped answering the request it was waiting on. Two pages, each with
+    # a stream and a poll, never stood a chance.
+    #
+    # daemon_threads so a shutdown isn't held up by streams that never end.
+    server = http.server.ThreadingHTTPServer((host, port), _LocalHandler)
+    server.daemon_threads = True
     print(f"[serve] listening on http://{host}:{port}", file=sys.stderr)
     print(f"[serve] llama: {llama_url}  model: {OLLAMA_MODEL or '(llama.cpp)'}", file=sys.stderr)
     if CAMERA_SNAPSHOT_PRIMARY or CAMERA_SNAPSHOT_FALLBACK:
@@ -1011,6 +1786,7 @@ def serve(host: str, port: int, llama_url: str):
 def main():
     global SYMPY_TIMEOUT, PROBLEM_TIMEOUT, TOTAL_TIMEOUT, OLLAMA_MODEL, VISION_MODEL
     global CAMERA_SNAPSHOT_PRIMARY, CAMERA_SNAPSHOT_FALLBACK, CAMERA_FRESH_MS
+    global STATE_FILE
 
     parser = argparse.ArgumentParser(description="Offline SymPy solver")
     parser.add_argument("--server", default="http://localhost:8787",
@@ -1044,6 +1820,10 @@ def main():
     parser.add_argument("--camera-fresh-ms", type=int, default=CAMERA_FRESH_MS,
                         help="how old a snapshot can be and still count as live "
                              "before /assignment/camera prefers the other camera")
+    parser.add_argument("--state-file",
+                        default=os.path.expanduser("~/.evens/solver-state.json"),
+                        help="where --serve keeps the assignment and its solutions "
+                             "so they survive a restart; empty to keep nothing")
     args = parser.parse_args()
 
     SYMPY_TIMEOUT = args.sympy_timeout
@@ -1054,6 +1834,7 @@ def main():
     CAMERA_SNAPSHOT_PRIMARY = args.camera_primary
     CAMERA_SNAPSHOT_FALLBACK = args.camera_fallback
     CAMERA_FRESH_MS = args.camera_fresh_ms
+    STATE_FILE = args.state_file
 
     if args.serve:
         serve(args.serve_host, args.serve_port, args.llama)

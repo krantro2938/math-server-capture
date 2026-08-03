@@ -28,6 +28,11 @@ RESTART_DELAY=3
 # default as SNAPSHOT_DIR in lookcam/run/config.env. Missing files are fine
 # (GET /assignment/camera just 503s until dual_capture.sh is running).
 SNAPSHOT_DIR="$HOME/lookcam-snapshots"
+# Where the solver keeps the assignment and the answers it has produced. This
+# loop restarts solver.py on every exit, and without a state file each restart
+# threw away the transcription and every solution with it — the glasses came
+# back to "NOTHING TO SOLVE" with nothing to say it had ever read anything.
+SOLVER_STATE="$HOME/.evens/solver-state.json"
 
 # Allow overrides from config
 [ -f config.local.env ] && source config.local.env
@@ -143,7 +148,8 @@ start_solver() {
       --vision-model "$VISION_MODEL" \
       --serve-port "$SERVE_PORT" \
       --camera-primary "$SNAPSHOT_DIR/primary.jpg" \
-      --camera-fallback "$SNAPSHOT_DIR/fallback.jpg" &
+      --camera-fallback "$SNAPSHOT_DIR/fallback.jpg" \
+      --state-file "$SOLVER_STATE" &
     SOLVER_PID=$!
 
     wait "$SOLVER_PID" 2>/dev/null || true
