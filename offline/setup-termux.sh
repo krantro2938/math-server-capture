@@ -224,12 +224,18 @@ echo ""
 
 # ── the study pack ──────────────────────────────────────────────────────────
 #
-# content/enc is the offline encyclopedia: ~4 MB of pre-rendered pages that
-# encyclopedia.py serves as static bytes (see its module docstring). It lives
-# in the `evens` submodule because that is where it is BUILT, and a shallow
-# clone of this repo does not check submodules out — so without this step the
-# glasses reach /enc/toc, get a 503, and the encyclopedia is simply absent with
-# nothing saying why.
+# content/enc is the offline encyclopedia: ~5 MB of pre-rendered pages that
+# encyclopedia.py serves as static bytes (see its module docstring).
+#
+# It ships in THIS repo, at offline/content/enc, so a plain `git pull` brings
+# it down. It is BUILT one directory over, in the evens submodule, and mirrored
+# here by evens/tools/enc/mirror.ts at the end of every build — because a clone
+# does not check submodules out, and the version that lived only in the
+# submodule was absent on every phone: /enc/* answered 503, and from the
+# glasses that looked like a download that fetched nothing.
+#
+# The submodule is still accepted below, for a checkout that predates the
+# mirror or a build that has not been mirrored yet.
 
 echo ""
 echo "--- Study pack (offline encyclopedia) ---"
@@ -254,8 +260,9 @@ if [ -n "$ENC_FOUND" ]; then
   echo "Study pack: $(du -sh "$ENC_FOUND" 2>/dev/null | cut -f1) at $ENC_FOUND"
 else
   echo "Study pack: NOT FOUND — /enc/* will return 503 and the Encyclopedia"
-  echo "            page on the glasses will be empty. Fix with:"
-  echo "              git -C $(cd "$SCRIPT_DIR/.." && pwd) submodule update --init --depth 1 evens"
+  echo "            page on the glasses will be empty. It ships in this repo,"
+  echo "            so this normally means the checkout is behind. Fix with:"
+  echo "              git -C $(cd "$SCRIPT_DIR/.." && pwd) pull"
 fi
 
 # ── config ──────────────────────────────────────────────────────────────────
